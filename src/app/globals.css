@@ -1,0 +1,289 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-inter);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/*
+  Vellum is dark-only in v1 (ADR-004). There is no light theme: these tokens
+  are the single source of truth, and <html> carries the `dark` class so the
+  shadcn `dark:` utilities resolve against these same values.
+
+  Hierarchy comes from contrast, never hue — the palette is strictly
+  monochrome (oklch chroma 0). The one exception is `--destructive`, which is
+  a functional state color (error/danger), not a brand accent.
+*/
+:root,
+.dark {
+  color-scheme: dark;
+
+  /* Monochrome surface ramp — single source of truth for every gray.
+     Low number = darkest (app background), high number = lightest (text). */
+  --gray-1: oklch(0.145 0 0); /* app background */
+  --gray-2: oklch(0.178 0 0); /* raised surface — cards, popovers */
+  --gray-3: oklch(0.205 0 0); /* sidebar / inset panels */
+  --gray-4: oklch(0.245 0 0); /* hover surface, muted/secondary fills */
+  --gray-5: oklch(0.285 0 0); /* pressed / active surface */
+  --gray-6: oklch(0.34 0 0); /* strong border, dividers on fills */
+  --gray-7: oklch(0.4 0 0);
+  --gray-8: oklch(0.47 0 0); /* disabled foreground */
+  --gray-9: oklch(0.556 0 0); /* focus ring, placeholders */
+  --gray-10: oklch(0.645 0 0);
+  --gray-11: oklch(0.708 0 0); /* muted foreground — secondary text */
+  --gray-12: oklch(0.985 0 0); /* foreground — high-contrast text */
+
+  /* Semantic tokens — every component reads these, not the ramp directly. */
+  --background: var(--gray-1);
+  --foreground: var(--gray-12);
+  --card: var(--gray-2);
+  --card-foreground: var(--gray-12);
+  --popover: var(--gray-2);
+  --popover-foreground: var(--gray-12);
+
+  /* Primary = inverted (light on dark), the Vercel/Linear high-emphasis fill. */
+  --primary: var(--gray-12);
+  --primary-foreground: var(--gray-3);
+  --secondary: var(--gray-4);
+  --secondary-foreground: var(--gray-12);
+  --muted: var(--gray-4);
+  --muted-foreground: var(--gray-11);
+  --accent: var(--gray-4);
+  --accent-foreground: var(--gray-12);
+
+  --destructive: oklch(0.704 0.191 22.216);
+
+  /* Priority tints (ADR-018) — the one place muted hue is allowed. A filled but
+     low-chroma pill: soft tint + readable text, themed per surface (light values
+     live in `.light`). Consumed via bg-[var(--priority-*)] in the task list. */
+  --priority-high: oklch(0.45 0.11 25); /* soft brick red */
+  --priority-high-foreground: oklch(0.97 0.02 25);
+  --priority-med: oklch(0.52 0.09 75); /* soft amber */
+  --priority-med-foreground: oklch(0.98 0.02 80);
+
+  /* Comment highlight (v1.1) — the SECOND sanctioned hue exception, same bar as
+     the ADR-018 priority tints: a deliberate, meaningful signal (text that has a
+     comment attached, or the span being commented). A muted, low-chroma yellow —
+     a "highlighter" fill with readable text, themed per surface (light below). */
+  --comment-highlight: oklch(0.5 0.09 100); /* muted yellow, dark surface */
+  --comment-highlight-foreground: oklch(0.98 0.02 100);
+
+  /* Hairline borders read best as low-alpha white on dark surfaces. */
+  --border: oklch(1 0 0 / 8%);
+  --input: oklch(1 0 0 / 12%);
+  --ring: var(--gray-9);
+
+  /* Charts stay on the same monochrome ramp (no category hues — ADR-004). */
+  --chart-1: var(--gray-11);
+  --chart-2: var(--gray-9);
+  --chart-3: var(--gray-7);
+  --chart-4: var(--gray-6);
+  --chart-5: var(--gray-5);
+
+  --radius: 0.5rem;
+
+  /* Sidebar sits one step above the app background so it reads as a panel,
+     separated by a hairline border rather than by elevation/shadow. */
+  --sidebar: var(--gray-3);
+  --sidebar-foreground: var(--gray-12);
+  --sidebar-primary: var(--gray-12);
+  --sidebar-primary-foreground: var(--gray-3);
+  --sidebar-accent: var(--gray-4);
+  --sidebar-accent-foreground: var(--gray-12);
+  --sidebar-border: oklch(1 0 0 / 8%);
+  --sidebar-ring: var(--gray-9);
+
+  /* App shell — sidebar width per breakpoint (set on SidebarProvider via a
+     var() reference so this cascade wins; an inline literal would not). */
+  --app-sidebar-width: 280px;
+}
+
+/*
+  Light theme (ADR-019, reverses ADR-004's dark-only lock). The light surface
+  ramp plays the inverse role of the dark ramp: gray-1 is the app background
+  (white), gray-12 the near-black text. Every semantic token below reads the same
+  ramp names, so swapping the ramp re-maps the whole palette; only the literal
+  (non-ramp) tokens — borders, destructive, priority tints — are overridden here.
+  next-themes toggles this `.light` class on <html> before paint.
+*/
+.light {
+  color-scheme: light;
+
+  /* Vercel/Geist-anchored: white content, panels a light gray, generous tonal
+     steps at the low end so selections/raised surfaces read on white (the dark
+     ramp's gray-1→3 step is ~0.06; the light ramp needs the same, not ~0.02, or
+     a selected row/card barely separates from the background). */
+  --gray-1: oklch(1 0 0); /* app / content background — white */
+  --gray-2: oklch(1 0 0); /* cards / popovers — white, lifted by border+shadow */
+  --gray-3: oklch(0.96 0 0); /* sidebar + raised card surface (~#f2f2f2) */
+  --gray-4: oklch(0.935 0 0); /* hover / selection fill + tabs (~#e9e9e9, Linear-soft) */
+  --gray-5: oklch(0.89 0 0); /* pressed / active surface */
+  --gray-6: oklch(0.85 0 0); /* strong border, dividers on fills */
+  --gray-7: oklch(0.78 0 0);
+  --gray-8: oklch(0.7 0 0); /* disabled foreground */
+  --gray-9: oklch(0.6 0 0); /* focus ring, placeholders */
+  --gray-10: oklch(0.52 0 0);
+  --gray-11: oklch(0.505 0 0); /* muted foreground — Linear-soft secondary text */
+  --gray-12: oklch(0.225 0 0); /* foreground — softer near-black (Linear ~#232326) */
+
+  /* Literal tokens retuned for a light surface. */
+  --destructive: oklch(0.577 0.245 27.325);
+
+  /* Priority tints on white — pale fill + saturated text, mirroring the dark
+     treatment inverted for the light surface (ADR-018). */
+  --priority-high: oklch(0.93 0.045 25);
+  --priority-high-foreground: oklch(0.47 0.17 25);
+  --priority-med: oklch(0.94 0.05 80);
+  --priority-med-foreground: oklch(0.5 0.12 75);
+
+  /* Comment highlight on white — pale yellow fill + saturated text, mirroring the
+     dark treatment inverted (same approach as the priority tints above). */
+  --comment-highlight: oklch(0.93 0.1 100);
+  --comment-highlight-foreground: oklch(0.47 0.12 95);
+
+  /* Hairlines stay subtle on white — lighter than the surfaces they divide, so
+     the tonal step does the separating and the border is just a hint (Vercel
+     ~#eaeaea). Heavier borders read as boxes; these read as edges. */
+  --border: oklch(0 0 0 / 6.5%);
+  --input: oklch(0 0 0 / 10%);
+  --sidebar-border: oklch(0 0 0 / 6.5%);
+}
+
+/* 768–1200px: narrower sidebar. Below 768px is not a target (desktop,
+   Chrome-only tool); the shadcn sidebar falls back to an off-canvas sheet. */
+@media (max-width: 1200px) {
+  :root {
+    --app-sidebar-width: 220px;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/*
+  Comment mode (v1.1) — while selecting text to comment on, tint the live browser
+  selection with the same muted comment-highlight yellow the saved highlight uses,
+  so "the span I'm about to comment" and "spans that already carry a comment" read
+  as one signal. Scoped to the commentable region (the class is added only in
+  Comment mode) so the app's default selection color is untouched everywhere else.
+*/
+.comment-selection ::selection,
+.comment-selection::selection {
+  background-color: var(--comment-highlight);
+  color: var(--comment-highlight-foreground);
+}
+
+/*
+  Empty-state illustration (TASK-39). Ambient, looped motion for the
+  nothing-selected home screen: the Vellum mark breathes while two square rings
+  echo outward — a quiet nod to "capture" without a spinner or accent color
+  (ADR-004). ADR-005's 150–250ms budget governs enter/interaction transitions;
+  an ambient loop must be slow to stay restrained rather than distracting, so
+  these run over ~3.6s. Motion is fully removed under prefers-reduced-motion.
+*/
+@keyframes vellum-breathe {
+  0%,
+  100% {
+    opacity: 0.75;
+    transform: scale(0.97);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes vellum-echo {
+  0% {
+    opacity: 0.35;
+    transform: scale(0.55);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.75);
+  }
+}
+
+.vellum-breathe {
+  animation: vellum-breathe 3.6s ease-in-out infinite;
+}
+
+.vellum-echo {
+  animation: vellum-echo 3.6s ease-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vellum-breathe {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+  .vellum-echo {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+/*
+  Subtle fade-out for the END of overflowing single-line text — the replacement
+  for the truncate ellipsis. This is the MASK only; it must be applied ONLY when
+  the text actually overflows (FadeText toggles it from a measured overflow),
+  otherwise it would dissolve the tail of text that fits. Pair it with
+  overflow-hidden + whitespace-nowrap on the same element.
+*/
+.fade-end {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
+}

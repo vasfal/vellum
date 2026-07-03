@@ -1,0 +1,82 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# Dependencies
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# Next.js
+.next/
+out/
+build
+next-env.d.ts
+
+# Production
+dist/
+
+# Environment — keep .env.example tracked, ignore real keys
+.env
+.env*.local
+
+# Editor
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Vellum-specific — recordings should never be committed
+*.webm
+*.mp4
+*.mov
+recordings/
+sessions/
+vellum-sessions/
+.bootstrap-status.md.bak
+
+# Internal / working files — kept on disk, NOT published to the public repo.
+# CLAUDE.md and backlog/ stay locally (Claude Code + the task system need them);
+# they're just untracked from here on. History still contains earlier copies.
+/CLAUDE.md
+/AGENTS.md
+/WORKFLOW.md
+/backlog/
+/docs/internal/
+/docs/intake-archive/
+/skills-lock.json
+/.bootstrap-status.md
+/.agents/
+/.claude/
+
+# Backlog drafts (incomplete tasks)
+backlog/drafts/
+
+# TypeScript
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Vercel
+.vercel
+
+# Misc
+.cache/
+.parcel-cache/
+*.pem
