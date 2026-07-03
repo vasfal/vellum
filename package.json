@@ -5,7 +5,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "description": "Think out loud over your screen; Vellum turns the recording into a structured report with timestamps, screenshots, and extracted tasks. Local-first, bring-your-own Gemini key.",
+  "description": "Vellum turns spoken screen reviews into structured task reports — every point you made, categorized, timestamped, and linked to the exact frame. Local-first, bring-your-own Gemini key.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/vasfal/vellum.git"

@@ -1,8 +1,8 @@
 # Vellum
 
-> Think out loud over your screen. Vellum turns the recording into a structured report — every point you made, timestamped, screenshotted, and sorted into tasks.
+> Vellum turns spoken screen reviews into structured task reports.
 
-The best reviews happen out loud: you point at something and say what's wrong with it — then it vanishes into a screen recording nobody rewatches. Vellum keeps the substance instead. Talk through the work, and get back a clean, actionable report — problems, ideas, questions, and decisions, each linked to the exact moment and frame it came from. It runs entirely on your machine, under your own API key: no account, no cloud.
+Talk through a design, a build, or a doc — point at what's wrong and say it — and get back every point you made as a discrete task: categorized, timestamped, and linked to the exact frame it came from. It runs entirely on your machine, under your own API key — no account, no cloud.
 
 Built for design and product reviews — the analysis is tuned for critiquing UI, checking a build against its design, and reviewing docs — but the mechanic works for any spoken walkthrough of a screen.
 
@@ -130,9 +130,8 @@ Re-running analysis keeps your history — the latest report is always `report.m
 Issues and pull requests are welcome. If you're developing Vellum rather than just using it, start with:
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — the current locked state of the system
-- [`DECISIONS.md`](DECISIONS.md) — the architecture decision log
 
-Vellum is developed with AI assistance; the architecture docs above are the source of truth for how it fits together.
+Vellum is developed with AI assistance; `ARCHITECTURE.md` is the source of truth for how it fits together.
 
 ## License
 

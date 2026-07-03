@@ -50,12 +50,13 @@ sessions/
 vellum-sessions/
 .bootstrap-status.md.bak
 
-# Internal / working files — kept on disk, NOT published to the public repo.
-# CLAUDE.md and backlog/ stay locally (Claude Code + the task system need them);
-# they're just untracked from here on. History still contains earlier copies.
+# Internal / working files — kept on disk, NOT published. Claude Code + the task
+# system + the design docs live here locally; they are never committed.
 /CLAUDE.md
 /AGENTS.md
 /WORKFLOW.md
+/DECISIONS.md
+/SCENARIOS.md
 /backlog/
 /docs/internal/
 /docs/intake-archive/
@@ -63,6 +64,8 @@ vellum-sessions/
 /.bootstrap-status.md
 /.agents/
 /.claude/
+/.dispatch/
+/.playwright-mcp/
 
 # Backlog drafts (incomplete tasks)
 backlog/drafts/
