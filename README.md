@@ -127,11 +127,10 @@ Re-running analysis keeps your history — the latest report is always `report.m
 
 ## Contributing
 
-Issues and pull requests are welcome — there are templates for both. If you're developing Vellum rather than just using it, start with:
+Issues and pull requests are welcome. If you're developing Vellum rather than just using it, start with:
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — the current locked state of the system
 - [`DECISIONS.md`](DECISIONS.md) — the architecture decision log
-- [`SCENARIOS.md`](SCENARIOS.md) — the core user scenarios the product supports
 
 Vellum is developed with AI assistance; the architecture docs above are the source of truth for how it fits together.
 

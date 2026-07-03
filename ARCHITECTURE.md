@@ -8,15 +8,15 @@
 
 ## System overview
 
-Vellum is a local-first Next.js application that runs at `localhost:3000` on the user's own machine. It records the screen + microphone, sends the recording to Google Gemini 2.5 Pro for analysis, extracts screenshots via ffmpeg, and writes a Markdown report to a user-chosen folder on disk.
+Vellum is a local-first Next.js application that runs at `localhost:4270` on the user's own machine. It records the screen + microphone, sends the recording to Google Gemini 2.5 Pro for analysis, extracts screenshots via ffmpeg, and writes a Markdown report to a user-chosen folder on disk.
 
-There is no backend service, no database, and no authentication. Each user runs their own copy from a cloned git repository, with their own Gemini API key.
+There is no backend service, no database, and no authentication. Each user runs their own copy — installed from npm (`npx @vasfal/vellum ui`) or run from a git checkout — with their own Gemini API key.
 
 ## Components
 
 ### Frontend (browser)
 
-Runs in the user's browser at `localhost:3000`. Built on Next.js 16 App Router, TypeScript strict, Tailwind v4, shadcn/ui.
+Runs in the user's browser at `localhost:4270`. Built on Next.js 16 App Router, TypeScript strict, Tailwind v4, shadcn/ui.
 
 Key responsibilities:
 - Folder picker (File System Access API), handle persisted in IndexedDB
@@ -149,7 +149,7 @@ Inside the user's chosen workspace folder:
 
 ## Data flow — happy path
 
-1. User opens `localhost:3000`. On first run, picks a workspace folder. Handle stored in IndexedDB; `.vellum-workspace.json` written to the folder.
+1. User opens `localhost:4270`. On first run, picks a workspace folder. Handle stored in IndexedDB; `.vellum-workspace.json` written to the folder.
 2. User clicks "New recording". Browser shows native screen picker (via `getDisplayMedia`). Microphone is captured separately (`getUserMedia`), on by default. A Document Picture-in-Picture window shows floating controls.
 3. MediaRecorder runs, blob streams in via `dataavailable` events with timeslice to avoid OOM on long recordings.
 4. User clicks Stop (in-page or on the PiP widget). Blob is finalized and written to a new timestamp-named session folder as `recording.webm`.
@@ -231,7 +231,7 @@ The glue command (TASK-8) is the only place that orchestrates these:
 
 - No persistent server state between dev server restarts
 - All file I/O is on the user's local machine; we never proxy user data through a third party except for Gemini API calls
-- API key never leaves the user's `.env.local`
+- API key never leaves the user's machine (`~/.vellum/.env`, or a dev checkout's `.env.local`)
 - Workspace folder access is permission-granted by the user per session via File System Access API; permission is re-requested when handle is restored from IndexedDB
 
 ## Performance targets
@@ -253,4 +253,4 @@ The glue command (TASK-8) is the only place that orchestrates these:
 - Native macOS app
 - Export integrations (Notion / Jira / etc.) and any extension point built for them — v2 territory, format undecided
 
-If you find yourself adding any of the above, stop and check with Vasyl. These are v2 territory.
+If you find yourself adding any of the above, stop — these are v2 territory.
