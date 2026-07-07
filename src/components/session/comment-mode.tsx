@@ -5,20 +5,24 @@
 // always available on the live document. This module is the toolkit the document
 // (report-document.tsx) composes:
 //
-//   • useDocumentTextSelection — watch for a text selection inside ONE commentable
-//     field / the overview and hand back a range target + its rect.
+//   • useDocumentTextSelection — watch for a text selection and resolve it to the
+//     tightest scope it covers: a text RANGE (one field/overview), a WHOLE task, or
+//     a GROUP of tasks (item 2) — with the rect to anchor a floating affordance to.
 //   • SelectionCommentButton — the floating "Comment" button shown at a fresh text
 //     selection (step 1); clicking it opens the composer (step 2).
 //   • CommentComposer — the popover to type a new comment (range OR whole-task OR
-//     task-group), anchored near the selection / trigger.
+//     task-group OR global), anchored near the selection / trigger, flipped above
+//     when it would overflow the viewport bottom (item 6).
 //   • CommentThreadPopover — click a highlighted span (or a task's comment badge) to
-//     read/edit/delete the comment(s) attached there (the missing "view" affordance).
-//   • TaskSelectionBar — the floating bar while one or more whole tasks are picked
-//     for a task / task-group comment.
-//   • ReviseBar — the sticky footer that turns accumulated comments into a new AI run
-//     (re-wires the removed comment→revise loop).
+//     read/edit/delete the comment(s) attached there (the click→view affordance).
+//   • CommentsPanel — the ONE collapsible bottom bar (item 5): a slim "N comments"
+//     bar + the comment→AI-revise controls, expanding into a scrollable list of
+//     every comment (row → scroll+flash its anchor, edit, delete); it also hosts the
+//     whole-task / group-selection actions, replacing the old floating overlay.
 //   • useCommentHighlights — paints saved range highlights via the CSS Custom
 //     Highlight API (Chromium; the app's target) and resolves a click to its comment.
+//     Block targets (task/group) can't be painted by a text Highlight — the document
+//     tints their section instead (.comment-section) and flashes it from the panel.
 //
 // Restrained (ADR-004): highlights use the muted comment-highlight yellow (the
 // sanctioned ADR-018/019 hue exception, token-based so both themes hold); popovers
@@ -33,7 +37,9 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
+  ChevronDown,
   Loader2,
+  MessageSquare,
   MessageSquarePlus,
   RefreshCw,
   Trash2,
@@ -55,6 +61,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import { InlineTextarea } from "./inline-edit";
 
 // ---- the selection → anchor seam -------------------------------------------
@@ -75,11 +82,33 @@ export function commentAnchor(
 /** A text-range target awaiting a comment (field range or overview range). */
 export type RangeTarget = Extract<CommentTarget, { type: "field" | "overview" }>;
 
-/** A captured selection: its resolved range target + the viewport rect to anchor a
+/** What a drag-selection can resolve to: a text RANGE (one field / the overview),
+ *  a WHOLE task (a multi-field drag inside one task), or a GROUP of tasks (a drag
+ *  spanning several). The whole session (global) is never a drag target — it's the
+ *  header's "Global comment" button. */
+export type SelectionTarget = Exclude<CommentTarget, { type: "global" }>;
+
+/** A captured selection: its resolved target + the viewport rect to anchor a
  *  floating affordance to (fixed positioning). */
 export interface PendingSelection {
-  target: RangeTarget;
+  target: SelectionTarget;
   rect: { top: number; bottom: number; left: number; right: number };
+}
+
+/** The composer's quiet context line, per target kind — the quote for a range, or a
+ *  plain description for a block target. */
+export function composerContextLabel(target: CommentTarget): string {
+  switch (target.type) {
+    case "field":
+    case "overview":
+      return `“${target.quote}”`;
+    case "task":
+      return "This task";
+    case "tasks":
+      return `${target.taskIds.length} tasks`;
+    case "global":
+      return "The whole session";
+  }
 }
 
 /** Is there a live, non-empty text selection right now? Inline editors read this to
@@ -106,9 +135,13 @@ function targetFromAnchor(attr: string, quote: string): RangeTarget | null {
   return { type: "field", taskId: scope, field: field as CommentTaskField, quote };
 }
 
-// While `active`, watch for a mouse-driven text selection that sits inside ONE
-// commentable field and hand back the pending selection. A selection spanning
-// outside a single field (or inside an editing textarea, or collapsed) is ignored.
+// While `active`, watch for a mouse-driven text selection and resolve it to the
+// TIGHTEST comment scope it covers (TASK-68.2 v2):
+//   • both ends in ONE field           → a text-range comment on that field/overview
+//   • across fields but ONE task        → a whole-task comment ({type:"task"})
+//   • spanning several tasks            → a group comment ({type:"tasks"})
+// A collapsed selection, one inside an editing textarea, or one that lands on no
+// commentable field/task is ignored.
 export function useDocumentTextSelection(
   active: boolean,
   containerRef: RefObject<HTMLElement | null>,
@@ -132,33 +165,41 @@ export function useDocumentTextSelection(
       if (!container || !container.contains(range.commonAncestorContainer)) return;
 
       // A selection inside an inline editor's textarea is native text editing, not a
-      // comment anchor — ignore it. (Textarea selections don't appear in the DOM
-      // Selection anyway, but guard the wrapper for safety.)
+      // comment anchor — ignore it.
       const startEl =
         range.startContainer.nodeType === Node.TEXT_NODE
           ? range.startContainer.parentElement
           : (range.startContainer as HTMLElement);
       if (startEl?.closest("textarea, input")) return;
 
-      const fieldEl = anchorElementOf(range.commonAncestorContainer);
-      // Require both ends inside the same field — a cross-field drag doesn't anchor.
-      if (
-        !fieldEl ||
-        !fieldEl.contains(range.startContainer) ||
-        !fieldEl.contains(range.endContainer)
-      ) {
+      const r = range.getBoundingClientRect();
+      const rect = { top: r.top, bottom: r.bottom, left: r.left, right: r.right };
+
+      // 1) Both ends in the SAME field → a text-range comment (the original path).
+      const startField = anchorElementOf(range.startContainer);
+      const endField = anchorElementOf(range.endContainer);
+      if (startField && startField === endField) {
+        const attr = startField.getAttribute(ANCHOR_ATTR);
+        const target = attr ? targetFromAnchor(attr, quote) : null;
+        if (target) onSelectRef.current({ target, rect });
         return;
       }
-      const attr = fieldEl.getAttribute(ANCHOR_ATTR);
-      if (!attr) return;
-      const target = targetFromAnchor(attr, quote);
-      if (!target) return;
 
-      const r = range.getBoundingClientRect();
-      onSelectRef.current({
-        target,
-        rect: { top: r.top, bottom: r.bottom, left: r.left, right: r.right },
-      });
+      // 2) Otherwise resolve to the task section(s) the selection touches. One task
+      //    → a whole-task comment; several → a group comment. (The overview isn't a
+      //    task section, so a stray overview+task drag resolves to the task(s).)
+      const taskIds = Array.from(
+        container.querySelectorAll<HTMLElement>("[data-task-id]"),
+      )
+        .filter((sec) => range.intersectsNode(sec))
+        .map((sec) => sec.getAttribute("data-task-id"))
+        .filter((id): id is string => Boolean(id));
+
+      if (taskIds.length === 1) {
+        onSelectRef.current({ target: { type: "task", taskId: taskIds[0] }, rect });
+      } else if (taskIds.length > 1) {
+        onSelectRef.current({ target: { type: "tasks", taskIds }, rect });
+      }
     };
     // Defer so the browser finalizes the selection before we read it.
     const handler = () => window.setTimeout(onMouseUp, 0);
@@ -305,16 +346,24 @@ export function useCommentHighlights(
 
 const POPOVER_WIDTH = 340;
 
-/** Clamp a floating popover under an anchor rect to the viewport. */
-function popoverPosition(rect: {
-  bottom: number;
-  left: number;
-}): { top: number; left: number } {
+/** Where to place a floating popover relative to an anchor rect (item 6): below it
+ *  by default, FLIPPED above when it would overflow the viewport bottom, and clamped
+ *  so it never spills off the right edge. `height` is the popover's approximate
+ *  height (so the flip math knows when it won't fit below). */
+function popoverPosition(
+  rect: { top?: number; bottom: number; left: number },
+  height = 200,
+): { top: number; left: number } {
+  const margin = 12;
   const left = Math.max(
-    12,
-    Math.min(rect.left, window.innerWidth - POPOVER_WIDTH - 12),
+    margin,
+    Math.min(rect.left, window.innerWidth - POPOVER_WIDTH - margin),
   );
-  const top = Math.min(rect.bottom + 8, window.innerHeight - 220);
+  let top = rect.bottom + 8;
+  if (top + height > window.innerHeight - margin) {
+    const above = (rect.top ?? rect.bottom) - height - 8;
+    top = above > margin ? above : Math.max(margin, window.innerHeight - height - margin);
+  }
   return { top, left };
 }
 
@@ -362,7 +411,7 @@ export function CommentComposer({
   onSave,
   onCancel,
 }: {
-  rect: { bottom: number; left: number };
+  rect: { top?: number; bottom: number; left: number };
   contextLabel: string;
   onSave: (body: string) => void;
   onCancel: () => void;
@@ -465,7 +514,7 @@ export function CommentThreadPopover({
   onDelete,
   onClose,
 }: {
-  rect: { bottom: number; left: number };
+  rect: { top?: number; bottom: number; left: number };
   comments: Comment[];
   tasks: AnchorTarget[];
   overview: string;
@@ -473,7 +522,7 @@ export function CommentThreadPopover({
   onDelete: (id: string) => void;
   onClose: () => void;
 }) {
-  const { top, left } = popoverPosition(rect);
+  const { top, left } = popoverPosition(rect, 240);
   return createPortal(
     <>
       <div className="fixed inset-0 z-40" onMouseDown={onClose} />
@@ -522,43 +571,33 @@ export function CommentThreadPopover({
   );
 }
 
-// ---- whole-task / group selection bar --------------------------------------
+// ---- panel row context -----------------------------------------------------
 
-// Shown while one or more whole tasks are picked. "Comment" opens the composer for a
-// single-task (count 1) or task-group (count > 1) comment; "Clear" drops the pick.
-export function TaskSelectionBar({
-  count,
-  onComment,
-  onClear,
-}: {
-  count: number;
-  onComment: () => void;
-  onClear: () => void;
-}) {
-  return createPortal(
-    <div
-      style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)" }}
-      className="z-50 flex items-center gap-3 rounded-full border border-border bg-popover px-3 py-1.5 text-popover-foreground shadow-md duration-150 animate-in fade-in-0 slide-in-from-bottom-2"
-    >
-      <span className="text-[13px] font-medium">
-        {count} {count === 1 ? "task" : "tasks"} selected
-      </span>
-      <span aria-hidden className="h-4 w-px bg-border" />
-      <Button size="sm" onClick={onComment}>
-        <MessageSquarePlus strokeWidth={1.5} />
-        {count === 1 ? "Comment on task" : "Comment on group"}
-      </Button>
-      <Button
-        variant="ghost"
-        size="sm"
-        className="text-muted-foreground hover:text-foreground"
-        onClick={onClear}
-      >
-        Clear
-      </Button>
-    </div>,
-    document.body,
-  );
+/** A comment's context for a PANEL row (item 5): a label that leads with the task
+ *  number/title (or Overview / Session / the group), and the quoted anchor text for
+ *  a range comment (shown even when degraded — the highlight just won't paint). */
+export function commentContext(
+  comment: Comment,
+  tasks: AnchorTarget[],
+): { label: string; quote?: string } {
+  const t = comment.target;
+  const num = (id: string) => {
+    const i = tasks.findIndex((x) => x.id === id);
+    return i >= 0 ? String(i + 1).padStart(2, "0") : "–";
+  };
+  const title = (id: string) => tasks.find((x) => x.id === id)?.title ?? "task";
+  switch (t.type) {
+    case "global":
+      return { label: "Session" };
+    case "overview":
+      return { label: "Overview", quote: t.quote };
+    case "field":
+      return { label: `Task ${num(t.taskId)} · ${title(t.taskId)}`, quote: t.quote };
+    case "task":
+      return { label: `Task ${num(t.taskId)} · ${title(t.taskId)}` };
+    case "tasks":
+      return { label: `${t.taskIds.length} tasks · ${t.taskIds.map(num).join(", ")}` };
+  }
 }
 
 // ---- the comment → AI revise footer ----------------------------------------
@@ -570,33 +609,49 @@ export type ReviseUiState =
   | { status: "running"; flavor: "text" | "video" }
   | { status: "error"; message: string };
 
-// The sticky document footer for commenting (TASK-68.2). It always shows a "Comment
-// on session" affordance (the home for a GLOBAL comment — reachable even with no
-// selection) and, once there are comments to act on, the re-wired comment→AI-revise
-// controls: a primary text-only "Process comments" and a secondary, clearly costlier
-// "Re-run with video". A running revise shows progress + Cancel.
-export function CommentFooter({
-  commentCount,
+// The sticky document footer for commenting (TASK-68.2 v2) — ONE bottom bar that is
+// collapsible into a full comments panel, and that ALSO hosts the group-selection
+// actions (replacing the old floating TaskSelectionBar). Three states:
+//   • a revise in flight        → progress + Cancel (owns the whole bar)
+//   • ≥1 whole task picked       → "N tasks selected · Comment on group · Clear"
+//   • otherwise                  → the collapsible panel: a slim "N comments" bar +
+//     the run actions, expanding UP into a scrollable list of every comment (each
+//     row → scroll+flash its anchor, edit, delete). The GLOBAL comment affordance
+//     moved to the pane header, so it's no longer here.
+export function CommentsPanel({
+  comments,
+  tasks,
   state,
   blocked,
-  onSessionComment,
+  taskSelectionCount,
+  onCommentGroup,
+  onClearSelection,
   onProcess,
   onReRunWithVideo,
   onCancel,
+  onRowActivate,
+  onEditComment,
+  onDeleteComment,
 }: {
-  commentCount: number;
+  comments: Comment[];
+  tasks: AnchorTarget[];
   state: ReviseUiState;
   blocked: boolean;
-  onSessionComment: (rect: { bottom: number; left: number }) => void;
+  /** How many WHOLE tasks are picked for a group comment (item 5). */
+  taskSelectionCount: number;
+  onCommentGroup: (rect: { top: number; bottom: number; left: number }) => void;
+  onClearSelection: () => void;
   onProcess: () => void;
   onReRunWithVideo: () => void;
   onCancel: () => void;
+  /** Reveal a comment's anchor on the canvas (scroll + flash) — the panel↔canvas
+   *  bidirectional twin of the highlights. */
+  onRowActivate: (comment: Comment) => void;
+  onEditComment: (id: string, body: string) => void;
+  onDeleteComment: (id: string) => void;
 }) {
-  // The session-comment button anchors the composer to its own on-screen rect.
-  const openSession = (e: React.MouseEvent<HTMLButtonElement>) => {
-    const r = e.currentTarget.getBoundingClientRect();
-    onSessionComment({ bottom: r.bottom, left: r.left });
-  };
+  const [expanded, setExpanded] = useState(false);
+  const count = comments.length;
 
   if (state.status === "running") {
     return (
@@ -613,49 +668,169 @@ export function CommentFooter({
     );
   }
 
-  return (
-    <div className="flex shrink-0 flex-col gap-1.5 border-t border-border bg-background px-4 py-2.5">
-      <div className="flex items-center justify-between gap-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          className="text-muted-foreground hover:text-foreground"
-          onClick={openSession}
+  // A group selection REPLACES the bar's normal content (item 5).
+  if (taskSelectionCount > 0) {
+    return (
+      <div className="flex shrink-0 items-center justify-between gap-3 border-t border-border bg-background px-4 py-2.5">
+        <span className="text-[13px] font-medium">
+          {taskSelectionCount} {taskSelectionCount === 1 ? "task" : "tasks"} selected
+        </span>
+        <div className="flex items-center gap-1.5">
+          <Button
+            size="sm"
+            onClick={(e) => {
+              const r = e.currentTarget.getBoundingClientRect();
+              onCommentGroup({ top: r.top, bottom: r.bottom, left: r.left });
+            }}
+          >
+            <MessageSquarePlus strokeWidth={1.5} />
+            {taskSelectionCount === 1 ? "Comment on task" : "Comment on group"}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground hover:text-foreground"
+            onClick={onClearSelection}
+          >
+            Clear
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  const runActions = count > 0 && (
+    <div className="flex items-center gap-1.5">
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground hover:text-foreground"
+              disabled={blocked}
+              onClick={onReRunWithVideo}
+            />
+          }
         >
-          <MessageSquarePlus strokeWidth={1.5} />
-          Comment on session
-        </Button>
-        {commentCount > 0 && (
-          <div className="flex items-center gap-1.5">
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    variant="ghost"
-                    className="text-muted-foreground hover:text-foreground"
-                    disabled={blocked}
-                    onClick={onReRunWithVideo}
-                  />
-                }
-              >
-                <RefreshCw strokeWidth={1.5} />
-                Re-run with video
-              </TooltipTrigger>
-              <TooltipContent>
-                Slower — re-watches the recording and extracts fresh screenshots
-              </TooltipContent>
-            </Tooltip>
-            <Button disabled={blocked} onClick={onProcess}>
-              <Wand strokeWidth={1.5} />
-              Process comments
-            </Button>
-          </div>
-        )}
+          <RefreshCw strokeWidth={1.5} />
+          Re-run with video
+        </TooltipTrigger>
+        <TooltipContent>
+          Slower — re-watches the recording and extracts fresh screenshots
+        </TooltipContent>
+      </Tooltip>
+      <Button size="sm" disabled={blocked} onClick={onProcess}>
+        <Wand strokeWidth={1.5} />
+        Process comments
+      </Button>
+    </div>
+  );
+
+  return (
+    <div className="flex shrink-0 flex-col border-t border-border bg-background">
+      {/* Expanded list sits ABOVE the bar so the bar stays pinned to the column's
+          bottom edge. */}
+      {expanded && count > 0 && (
+        <ul className="flex max-h-[40vh] flex-col divide-y divide-border/60 overflow-y-auto border-b border-border">
+          {comments.map((comment) => (
+            <CommentRow
+              key={comment.id}
+              comment={comment}
+              tasks={tasks}
+              onActivate={() => onRowActivate(comment)}
+              onEdit={(body) => onEditComment(comment.id, body)}
+              onDelete={() => onDeleteComment(comment.id)}
+            />
+          ))}
+        </ul>
+      )}
+      <div className="flex items-center justify-between gap-2 px-4 py-2.5">
+        <button
+          type="button"
+          onClick={() => count > 0 && setExpanded((v) => !v)}
+          disabled={count === 0}
+          aria-expanded={expanded}
+          className="flex items-center gap-1.5 rounded-sm text-[13px] text-muted-foreground transition-colors duration-150 ease-out hover:text-foreground disabled:pointer-events-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        >
+          {count > 0 ? (
+            <ChevronDown
+              className={cn(
+                "size-3.5 transition-transform duration-150 ease-out",
+                expanded ? "" : "-rotate-90",
+              )}
+              strokeWidth={1.5}
+            />
+          ) : (
+            <MessageSquare className="size-3.5" strokeWidth={1.5} />
+          )}
+          {count === 0
+            ? "No comments yet"
+            : `${count} ${count === 1 ? "comment" : "comments"}`}
+        </button>
+        {runActions}
       </div>
       {state.status === "error" && (
-        <p className="text-[11px] leading-snug text-destructive">{state.message}</p>
+        <p className="px-4 pb-2.5 text-[11px] leading-snug text-destructive">
+          {state.message}
+        </p>
       )}
     </div>
+  );
+}
+
+// One comment in the expanded panel: a context tag (task number/title · Overview ·
+// Session · group), the quoted anchor (range comments), and the editable body.
+// Clicking the tag or the quote reveals the anchor on the canvas (scroll + flash).
+function CommentRow({
+  comment,
+  tasks,
+  onActivate,
+  onEdit,
+  onDelete,
+}: {
+  comment: Comment;
+  tasks: AnchorTarget[];
+  onActivate: () => void;
+  onEdit: (body: string) => void;
+  onDelete: () => void;
+}) {
+  const { label, quote } = commentContext(comment, tasks);
+  return (
+    <li className="group/row flex flex-col gap-1 px-4 py-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={onActivate}
+          className="min-w-0 flex-1 truncate text-left text-[11px] font-medium uppercase tracking-wide text-muted-foreground/80 transition-colors hover:text-foreground active:opacity-80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        >
+          {label}
+        </button>
+        <button
+          type="button"
+          onClick={onDelete}
+          aria-label="Delete comment"
+          className="shrink-0 rounded-sm p-1 text-muted-foreground opacity-0 transition-opacity duration-150 ease-out hover:text-destructive active:opacity-80 group-hover/row:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        >
+          <Trash2 className="size-3.5" strokeWidth={1.5} />
+        </button>
+      </div>
+      {quote && (
+        <button
+          type="button"
+          onClick={onActivate}
+          className="line-clamp-1 border-l-2 border-border pl-2 text-left text-[11px] italic leading-snug text-muted-foreground transition-colors hover:text-foreground"
+        >
+          “{quote}”
+        </button>
+      )}
+      <InlineTextarea
+        value={comment.body}
+        ariaLabel="Comment"
+        className="text-[13px] leading-relaxed text-foreground"
+        onCommit={onEdit}
+      />
+    </li>
   );
 }
 

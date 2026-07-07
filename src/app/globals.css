@@ -110,6 +110,13 @@
      a "highlighter" fill with readable text, themed per surface (light below). */
   --comment-highlight: oklch(0.5 0.09 100); /* muted yellow, dark surface */
   --comment-highlight-foreground: oklch(0.98 0.02 100);
+  /* Block-target washes (TASK-68.2 v2). A text Highlight can only paint a text
+     RANGE — it can't mark a whole task/group. So a committed task/group comment
+     tints its section (--comment-tint) and a click from the comments panel flashes
+     it (--comment-flash). Both derive from the comment hue but stay low-alpha so
+     the monochrome document reads calm on the dark surface. */
+  --comment-tint: oklch(0.62 0.1 100 / 14%);
+  --comment-flash: oklch(0.62 0.12 100 / 32%);
 
   /* Hairline borders read best as low-alpha white on dark surfaces. */
   --border: oklch(1 0 0 / 8%);
@@ -183,6 +190,9 @@
      dark treatment inverted (same approach as the priority tints above). */
   --comment-highlight: oklch(0.93 0.1 100);
   --comment-highlight-foreground: oklch(0.47 0.12 95);
+  /* Block-target washes on white — pale but present, mirroring the dark values. */
+  --comment-tint: oklch(0.88 0.11 100 / 55%);
+  --comment-flash: oklch(0.84 0.13 100 / 75%);
 
   /* Hairlines stay subtle on white — lighter than the surfaces they divide, so
      the tonal step does the separating and the border is just a hint (Vercel
@@ -245,6 +255,37 @@
   color: var(--comment-highlight-foreground);
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+
+/*
+  TASK-68.2 v2 — BLOCK-target marking. A `task` / `tasks` comment annotates a whole
+  section, which a text Highlight can't cover, so a committed one tints its section
+  with a soft left-accented wash (the same comment hue, kept low-alpha). This is the
+  panel row's on-canvas twin — the two are two views of one comment (Plannotator).
+*/
+.comment-section {
+  background-color: var(--comment-tint);
+  box-shadow: inset 2px 0 0 0 var(--comment-highlight);
+}
+
+/*
+  Bidirectional reveal — clicking a row in the comments panel scrolls to its anchor
+  and FLASHES it (a one-shot wash that fades out), so a comment with no visible text
+  highlight (a task/group/overview target) still announces where it lives. Removed
+  under reduced-motion (the scroll-into-view alone locates it).
+*/
+@keyframes vellum-comment-flash {
+  0% { background-color: var(--comment-flash); }
+  100% { background-color: transparent; }
+}
+.comment-flash {
+  animation: vellum-comment-flash 1.1s ease-out;
+  border-radius: 6px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .comment-flash {
+    animation: none;
+  }
 }
 
 /*

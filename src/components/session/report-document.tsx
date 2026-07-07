@@ -33,8 +33,10 @@
 // run renders the same document READ-ONLY (no controls, no highlights).
 
 import {
+  forwardRef,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useRef,
   useState,
@@ -82,11 +84,11 @@ import { EditMarker, EnumSelect, InlineText } from "./inline-edit";
 import { MarkdownText } from "./markdown-text";
 import {
   CommentComposer,
-  CommentFooter,
+  CommentsPanel,
   CommentThreadPopover,
   SelectionCommentButton,
-  TaskSelectionBar,
   commentAnchor,
+  composerContextLabel,
   hasActiveSelection,
   taskLevelComments,
   useCommentHighlights,
@@ -98,45 +100,23 @@ import {
 /** The composer's open state: the target it will create + where to anchor it. */
 interface ComposerState {
   target: CommentTarget;
-  rect: { bottom: number; left: number };
+  rect: { top?: number; bottom: number; left: number };
   contextLabel: string;
 }
 
 /** The click-to-view thread: which comment ids to show + where. */
 interface ThreadState {
   ids: string[];
-  rect: { bottom: number; left: number };
+  rect: { top?: number; bottom: number; left: number };
 }
 
-export function ReportDocument({
-  analysis,
-  malformed,
-  overview,
-  editing,
-  baselineById,
-  overviewBaseline,
-  onOverviewChange,
-  onTaskChange,
-  onAddTask,
-  onDeleteTask,
-  onMoveTask,
-  onSeek,
-  workspace,
-  name,
-  screenshotsDir,
-  reloadToken,
-  // ---- TASK-68.2 commenting ----
-  commenting,
-  comments,
-  reviseState,
-  reviseBlocked,
-  onAddComment,
-  onEditComment,
-  onDeleteComment,
-  onProcessComments,
-  onReRunWithVideo,
-  onCancelRevise,
-}: {
+/** Imperative surface the pane header drives (item 4): open the composer for a
+ *  GLOBAL (whole-session) comment, anchored under the header's button. */
+export interface ReportDocumentHandle {
+  openGlobalComment: (rect: { top?: number; bottom: number; left: number }) => void;
+}
+
+export const ReportDocument = forwardRef<ReportDocumentHandle, {
   /** The active run's analysis: the live editable draft, or a read-only archive. */
   analysis: StoredAnalysisResult | null;
   /** The active run's tasks.json couldn't be parsed — show a quiet notice. */
@@ -178,7 +158,38 @@ export function ReportDocument({
   onProcessComments: () => void;
   onReRunWithVideo: () => void;
   onCancelRevise: () => void;
-}) {
+}>(function ReportDocument(
+  {
+    analysis,
+    malformed,
+    overview,
+    editing,
+    baselineById,
+    overviewBaseline,
+    onOverviewChange,
+    onTaskChange,
+    onAddTask,
+    onDeleteTask,
+    onMoveTask,
+    onSeek,
+    workspace,
+    name,
+    screenshotsDir,
+    reloadToken,
+    // ---- TASK-68.2 commenting ----
+    commenting,
+    comments,
+    reviseState,
+    reviseBlocked,
+    onAddComment,
+    onEditComment,
+    onDeleteComment,
+    onProcessComments,
+    onReRunWithVideo,
+    onCancelRevise,
+  },
+  ref,
+) {
   const urls = useSessionScreenshots(workspace, name, screenshotsDir, reloadToken);
   const taskCount = analysis?.tasks.length ?? 0;
   // The overview block shows whenever there IS one, or while editing so an empty
@@ -261,53 +272,101 @@ export function ReportDocument({
     );
   }, []);
 
-  // Step 2: promote a captured selection into the composer.
+  // Step 2: promote a captured selection into the composer. The selection may be a
+  // text range (field/overview) OR a whole-task / group scope (item 2) — the
+  // composer + context label handle all of them uniformly.
   const openComposerFromSelection = useCallback(() => {
     setPendingSelection((sel) => {
       if (sel) {
         setComposer({
           target: sel.target,
-          rect: { bottom: sel.rect.bottom, left: sel.rect.left },
-          contextLabel: `“${sel.target.quote}”`,
+          rect: { top: sel.rect.top, bottom: sel.rect.bottom, left: sel.rect.left },
+          contextLabel: composerContextLabel(sel.target),
         });
       }
       return null;
     });
   }, []);
 
-  // Open the composer for the whole-task / task-group selection, anchored centrally.
-  const openComposerFromTasks = useCallback(() => {
-    setTaskSelection((ids) => {
-      if (ids.length > 0) {
-        const target: CommentTarget =
-          ids.length === 1
-            ? { type: "task", taskId: ids[0] }
-            : { type: "tasks", taskIds: ids };
-        setComposer({
-          target,
-          rect: {
-            bottom: window.innerHeight - 72,
-            left: Math.max(12, window.innerWidth / 2 - 170),
-          },
-          contextLabel:
-            ids.length === 1 ? "This task" : `${ids.length} tasks`,
-        });
-      }
-      return ids; // keep the selection until the comment is saved
-    });
-  }, []);
-
-  // The footer "Comment on session" button opens the composer for a global comment.
-  const openSessionComposer = useCallback(
-    (rect: { bottom: number; left: number }) => {
-      setComposer({
-        target: { type: "global" },
-        rect,
-        contextLabel: "Comment on the whole session",
+  // Open the composer for the footer's whole-task / task-group selection, anchored to
+  // the footer button that triggered it (item 5 — no floating overlay).
+  const openComposerFromTasks = useCallback(
+    (rect: { top: number; bottom: number; left: number }) => {
+      setTaskSelection((ids) => {
+        if (ids.length > 0) {
+          const target: CommentTarget =
+            ids.length === 1
+              ? { type: "task", taskId: ids[0] }
+              : { type: "tasks", taskIds: ids };
+          setComposer({ target, rect, contextLabel: composerContextLabel(target) });
+        }
+        return ids; // keep the selection until the comment is saved
       });
     },
     [],
   );
+
+  // The pane HEADER's "Global comment" button opens the composer for a global
+  // comment (item 4), exposed imperatively so the header (in session-view) can drive
+  // this document's composer state.
+  const openGlobalComment = useCallback(
+    (rect: { top?: number; bottom: number; left: number }) => {
+      setComposer({
+        target: { type: "global" },
+        rect,
+        contextLabel: composerContextLabel({ type: "global" }),
+      });
+    },
+    [],
+  );
+  useImperativeHandle(ref, () => ({ openGlobalComment }), [openGlobalComment]);
+
+  // Reveal a comment's anchor on the canvas (item 3 / item 7 — the panel↔canvas
+  // bidirectional link): scroll it into view and flash it. Range comments already
+  // carry a text highlight; task/group/overview targets flash their section/field so
+  // a comment with no visible text mark still announces where it lives.
+  const flashComment = useCallback((comment: Comment) => {
+    const container = scrollRef.current;
+    if (!container) return;
+    const t = comment.target;
+    const els: HTMLElement[] = [];
+    const anchorEl = (anchor: string) =>
+      container.querySelector<HTMLElement>(
+        `[data-comment-anchor="${CSS.escape(anchor)}"]`,
+      );
+    const sectionEl = (taskId: string) =>
+      container.querySelector<HTMLElement>(
+        `[data-task-id="${CSS.escape(taskId)}"]`,
+      );
+    if (t.type === "overview") {
+      const el = anchorEl(commentAnchor("overview", "overview"));
+      if (el) els.push(el);
+    } else if (t.type === "field") {
+      const el = anchorEl(commentAnchor(t.taskId, t.field)) ?? sectionEl(t.taskId);
+      if (el) els.push(el);
+    } else if (t.type === "task") {
+      const el = sectionEl(t.taskId);
+      if (el) els.push(el);
+    } else if (t.type === "tasks") {
+      for (const id of t.taskIds) {
+        const el = sectionEl(id);
+        if (el) els.push(el);
+      }
+    } else {
+      // global — nothing to point at; scroll to the top of the document.
+      container.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+    if (els.length === 0) return;
+    els[0].scrollIntoView({ behavior: "smooth", block: "center" });
+    for (const el of els) {
+      el.classList.remove("comment-flash");
+      // Reflow so re-adding the class restarts the animation if it's still running.
+      void el.offsetWidth;
+      el.classList.add("comment-flash");
+      window.setTimeout(() => el.classList.remove("comment-flash"), 1200);
+    }
+  }, []);
 
   const submitComposer = useCallback(
     (body: string) => {
@@ -421,16 +480,23 @@ export function ReportDocument({
         </div>
       </div>
 
-      {/* Commenting footer — the session-comment affordance + the revise controls. */}
+      {/* Commenting footer — one collapsible comments panel that also hosts the
+          group-selection actions (no floating overlay). */}
       {commenting && (
-        <CommentFooter
-          commentCount={comments.length}
+        <CommentsPanel
+          comments={comments}
+          tasks={tasks}
           state={reviseState}
           blocked={reviseBlocked}
-          onSessionComment={openSessionComposer}
+          taskSelectionCount={taskSelection.length}
+          onCommentGroup={openComposerFromTasks}
+          onClearSelection={() => setTaskSelection([])}
           onProcess={onProcessComments}
           onReRunWithVideo={onReRunWithVideo}
           onCancel={onCancelRevise}
+          onRowActivate={flashComment}
+          onEditComment={onEditComment}
+          onDeleteComment={onDeleteComment}
         />
       )}
 
@@ -460,16 +526,9 @@ export function ReportDocument({
           onClose={() => setThread(null)}
         />
       )}
-      {commenting && taskSelection.length > 0 && !composer && (
-        <TaskSelectionBar
-          count={taskSelection.length}
-          onComment={openComposerFromTasks}
-          onClear={() => setTaskSelection([])}
-        />
-      )}
     </div>
   );
-}
+});
 
 // The session overview at the top of the document: markdown-aware inline edit when
 // editing, rendered markdown when read-only. A quiet edited-marker + revert sits
@@ -605,7 +664,13 @@ function TaskSection({
     <section
       data-task-id={task.id}
       className={cn(
-        "group relative flex scroll-mt-4 flex-col gap-3 py-8",
+        "group relative flex scroll-mt-4 flex-col gap-3 py-8 transition-colors duration-150 ease-out",
+        // A committed task/group comment tints the whole section (item 3) — the
+        // on-canvas twin of its row in the comments panel. A text Highlight can't
+        // cover a block, so this soft left-accented wash marks it instead.
+        commenting &&
+          taskComments.length > 0 &&
+          "comment-section -mx-3 rounded-md px-3",
         selectedForComment &&
           "rounded-lg ring-1 ring-inset ring-foreground/25",
       )}

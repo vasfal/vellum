@@ -11,6 +11,7 @@ import {
   FileText,
   FileVideo,
   Loader2,
+  MessageSquarePlus,
   MoreHorizontal,
   Pencil,
   RefreshCw,
@@ -84,7 +85,7 @@ import { cn } from "@/lib/utils";
 import { FadeText } from "@/components/fade-text";
 import { PageHeader } from "@/components/page-header";
 import { AnalyzeStatus, type AnalyzeState } from "./analyze-action";
-import { ReportDocument } from "./report-document";
+import { ReportDocument, type ReportDocumentHandle } from "./report-document";
 import type { ReviseUiState } from "./comment-mode";
 
 // TASK-17 — the session view. Loads one session's tasks.json + recording.webm
@@ -1626,40 +1627,69 @@ function RightColumn({
   onReRunWithVideo: () => void;
   onCancelRevise: () => void;
 }) {
-  // The header row shows whenever there's something to put in it: a run to export
-  // (report.md or a parsed analysis → the download kebab) or an archived run to
-  // leave (Go to latest). Otherwise it's omitted so the document owns the column.
+  // The header row: a "Tasks" title on the LEFT (item 4), and on the RIGHT the
+  // Go-to-latest (archives), the "Global comment" affordance (the home for a
+  // whole-session comment, moved out of the footer — item 4), and the download
+  // kebab. Shown whenever there's a run to title/export or an archive to leave.
   const canDownload = reportFile !== null || analysis !== null;
   const showHeader = canDownload || viewingArchive;
+  // Drives this document's composer for a global comment from the header button.
+  const reportRef = useRef<ReportDocumentHandle>(null);
 
   return (
     <div className="flex min-h-0 flex-col">
       {showHeader && (
-        <div className="flex shrink-0 items-center justify-end gap-2 border-b border-border px-4 pt-3 pb-3">
-          {viewingArchive && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-muted-foreground hover:text-foreground"
-              onClick={onGoToLatest}
-            >
-              Go to latest run
-            </Button>
-          )}
-          <DownloadMenu
-            reportFile={reportFile}
-            analysis={analysis}
-            workspace={workspace}
-            name={name}
-            displayName={displayName}
-            stamp={downloadStamp}
-          />
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-4 pt-3 pb-3">
+          <div className="flex min-w-0 items-center gap-2">
+            {analysis !== null && (
+              <span className="text-[13px] font-medium text-foreground">Tasks</span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5">
+            {viewingArchive && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-muted-foreground hover:text-foreground"
+                onClick={onGoToLatest}
+              >
+                Go to latest run
+              </Button>
+            )}
+            {commenting && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-muted-foreground hover:text-foreground"
+                onClick={(e) => {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  reportRef.current?.openGlobalComment({
+                    top: r.top,
+                    bottom: r.bottom,
+                    left: r.left,
+                  });
+                }}
+              >
+                <MessageSquarePlus strokeWidth={1.5} />
+                Global comment
+              </Button>
+            )}
+            <DownloadMenu
+              reportFile={reportFile}
+              analysis={analysis}
+              workspace={workspace}
+              name={name}
+              displayName={displayName}
+              stamp={downloadStamp}
+            />
+          </div>
         </div>
       )}
       {loading ? (
         <RunLoading />
       ) : (
         <ReportDocument
+          ref={reportRef}
           analysis={analysis}
           malformed={malformed}
           overview={overview}

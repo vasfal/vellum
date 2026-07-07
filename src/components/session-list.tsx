@@ -6,12 +6,13 @@ import { usePathname, useRouter } from "next/navigation";
 import { Menu } from "@base-ui/react/menu";
 import {
   CircleDashed,
-  FileArchive,
   Film,
   Loader2,
   MoreHorizontal,
   Pencil,
+  RefreshCw,
   Trash2,
+  Wand,
 } from "lucide-react";
 
 import { useAnalysis } from "@/components/analysis/analysis-provider";
@@ -48,7 +49,6 @@ import {
   writeOverrideName,
 } from "@/lib/filesystem/session-name";
 import { matchesQuery, type SessionRow } from "@/lib/filesystem/sessions";
-import { downloadRunZip } from "@/lib/filesystem/export-zip";
 
 // TASK-14 — the session list inside the sidebar. Scans the workspace via
 // useSessions and renders one row per marked session, most-recent first.
@@ -125,27 +125,6 @@ function SessionMenuItem({ session }: { session: SessionRow }) {
   const [renaming, setRenaming] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  const [zipping, setZipping] = useState(false);
-
-  // TASK-71 — export the session's LATEST run (stamp: null) as one zip, from the
-  // row menu. Reuses the same downloadRunZip util as the session-view header; a
-  // read/zip failure is a silent no-op (best-effort, like the header export).
-  const saveZip = useCallback(async () => {
-    if (zipping) return;
-    setZipping(true);
-    try {
-      await downloadRunZip({
-        workspace: handle,
-        name: session.name,
-        displayName: session.displayName,
-        stamp: null,
-      });
-    } catch {
-      // The run's files vanished / a read failed mid-zip — leave the list usable.
-    } finally {
-      setZipping(false);
-    }
-  }, [zipping, handle, session.name, session.displayName]);
 
   // Seed the draft from the CURRENT name each time the dialog opens, so it always
   // reflects a fresh suggested_name / prior rename without a sync effect.
@@ -202,8 +181,17 @@ function SessionMenuItem({ session }: { session: SessionRow }) {
   // TASK-42 — if THIS session is the one being analyzed, the row reports live
   // progress: a spinner in place of the film icon, the phase in the meta slot,
   // and a thin determinate bar along the bottom edge.
-  const { analysis } = useAnalysis();
+  const { analysis, analyze } = useAnalysis();
   const analyzing = analysis?.name === session.name ? analysis : null;
+  // TASK-68.2 v2 (item 1) — the row kebab offers a SESSION-level analyze action,
+  // wired exactly like the session-view header's MoreActions: analyze(name), the
+  // label Analyze vs Re-analyze from whether it's ever been analyzed. Blocked while
+  // THIS or another session is running (one run at a time), or when the session
+  // can't be analyzed (an incomplete row, e.g. no recording).
+  const otherAnalyzing = analysis !== null && analysis.name !== session.name;
+  const analyzeBlocked = analyzing !== null || otherAnalyzing || session.incomplete;
+  const onAnalyze = useCallback(() => analyze(session.name), [analyze, session.name]);
+  const AnalyzeIcon = analyzing ? Loader2 : session.unanalyzed ? Wand : RefreshCw;
 
   // Status is now tooltip-only (badges removed): the row conveys it through the
   // icon (dashed ring vs. film) and the tooltip spells it out.
@@ -311,20 +299,18 @@ function SessionMenuItem({ session }: { session: SessionRow }) {
                 <Pencil strokeWidth={1.5} />
                 Rename
               </Menu.Item>
-              {/* TASK-71 — export the latest run. closeOnClick=false keeps the
-                  menu open so the spinner shows while the recording is zipped. */}
+              {/* Item 1 — analyze this session (a SESSION action). A run zip is a
+                  RUN action, so it lives only in the run's download menu now. */}
               <Menu.Item
-                onClick={saveZip}
-                closeOnClick={false}
-                disabled={zipping}
+                onClick={onAnalyze}
+                disabled={analyzeBlocked}
                 className="flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none data-[disabled]:opacity-50 data-[highlighted]:bg-accent"
               >
-                {zipping ? (
-                  <Loader2 className="animate-spin" strokeWidth={1.5} />
-                ) : (
-                  <FileArchive strokeWidth={1.5} />
-                )}
-                {zipping ? "Preparing…" : "Download (ZIP)"}
+                <AnalyzeIcon
+                  className={analyzing ? "animate-spin" : undefined}
+                  strokeWidth={1.5}
+                />
+                {session.unanalyzed ? "Analyze" : "Re-analyze"}
               </Menu.Item>
               <Menu.Item
                 onClick={() => setDeleteOpen(true)}
