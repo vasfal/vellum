@@ -7,18 +7,13 @@ import {
   Check,
   Copy,
   Download,
-  Eye,
   FileText,
   FileVideo,
-  ListChecks,
   Loader2,
-  MessageSquareText,
   MoreHorizontal,
   Pencil,
-  Plus,
   RefreshCw,
   Trash2,
-  TriangleAlert,
   Wand,
   X,
 } from "lucide-react";
@@ -41,10 +36,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useAnalysis } from "@/components/analysis/analysis-provider";
-import {
-  AnalysisConfigDialog,
-  type AnalysisConfig,
-} from "@/components/analysis/analysis-config-dialog";
 import { useWorkspace } from "@/components/workspace/workspace-provider";
 import { useObjectUrl } from "@/hooks/useObjectUrl";
 import {
@@ -62,11 +53,7 @@ import {
   readAiBaseline,
   saveSessionEdits,
 } from "@/lib/filesystem/write-edits-browser";
-import { readComments, writeComments } from "@/lib/filesystem/comments-browser";
 import { downloadTextFile } from "@/lib/filesystem/download";
-import { mintCommentId, type Comment } from "@/lib/comments/comment";
-import { AnalyzeFlowError, runAnalyze } from "@/lib/analyze/run-analyze";
-import { runRevise } from "@/lib/analyze/run-revise";
 import {
   kebabCase,
   mmssToSec,
@@ -83,17 +70,7 @@ import { cn } from "@/lib/utils";
 import { FadeText } from "@/components/fade-text";
 import { PageHeader } from "@/components/page-header";
 import { AnalyzeStatus, type AnalyzeState } from "./analyze-action";
-import { EditMarker, InlineTextarea } from "./inline-edit";
-import {
-  CommentComposer,
-  CommentableText,
-  CommentsPanel,
-  taskCardDomId,
-  useCommentSelection,
-  type PendingAnchor,
-} from "./comment-mode";
-import { ReportView } from "./report-view";
-import { TaskListItem } from "./task-list-item";
+import { ReportDocument } from "./report-document";
 
 // TASK-17 — the session view. Loads one session's tasks.json + recording.webm
 // through the live workspace handle (TASK-15) and lays out a sticky video player
@@ -364,14 +341,6 @@ export function SessionView({ name }: { name: string }) {
         reloadKey={`${reloadNonce}:${completedCount}`}
         selectedRun={selectedRun}
         onSelectRun={setSelectedRun}
-        otherAnalysisActive={analysis !== null}
-        onRunReplaced={() => {
-          // A revise wrote a new run: snap to the latest, reload in place, and
-          // re-scan the sidebar (TASK-60), exactly like an analysis completion.
-          setSelectedRun(null);
-          setReloadNonce((n) => n + 1);
-          refreshSessions();
-        }}
       />
 
       {/* Cancel-analysis confirmation (TASK-42). Nothing is written until the run
@@ -916,8 +885,6 @@ function Body({
   reloadKey,
   selectedRun,
   onSelectRun,
-  otherAnalysisActive,
-  onRunReplaced,
 }: {
   data: SessionData | null;
   /** The kept-previous-data skeleton gate: true only on first load or a slow
@@ -937,50 +904,24 @@ function Body({
   // Info tab can switch runs and the body can render the selected one.
   selectedRun: SelectedRun | null;
   onSelectRun: (run: SelectedRun | null) => void;
-  // TASK-60 — an analysis run (in the app-level controller) is active anywhere;
-  // block starting a revise while one is (one AI action at a time).
-  otherAnalysisActive: boolean;
-  // TASK-60 — a revise wrote a new run; ask the parent to reload the view + sidebar.
-  onRunReplaced: () => void;
 }) {
-  // The player lives in the left column; a task click in the right column seeks
-  // it. A shared ref is the seam between the two panes (TASK-18). Declared
-  // unconditionally so hooks order is stable across load states.
+  // The player lives in the left column; a timecode / screenshot click in the
+  // document (right column) seeks it. A shared ref is the seam between the two
+  // panes (TASK-18). Declared unconditionally so hooks order is stable.
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [selected, setSelected] = useState<number | null>(null);
-  // A task click both selects and seeks; a manual scrub should DESELECT (the
-  // highlighted task no longer matches the playhead). We tell the two apart with
-  // a flag set right before our own seek and consumed by the seeking handler.
-  const programmaticSeek = useRef(false);
 
   // TASK-51 — when an older run is selected, load its tasks (from the ADR-009
   // archive) to render in place of the latest. Idle for the latest run.
   const archived = useArchivedRun(workspace, name, selectedRun?.source ?? null);
-  // Row indices don't carry across runs OR sessions, so drop the selection when
-  // the run switches or the session changes (the highlighted task no longer means
-  // anything in the new list). The `name` reset matters now that keep-previous
-  // data keeps this component mounted across navigation instead of remounting it.
-  useEffect(() => {
-    setSelected(null);
-  }, [selectedRun?.source, name]);
 
+  // TASK-68.1 — seek the player to an "mm:ss" moment (discussed / visible). No
+  // recording (incomplete session) or no timestamp (a human task with no moment —
+  // ADR-024) → nothing to seek. There's no row-selection to preserve anymore (the
+  // document has no single primary-action overlay), so this just moves the head.
   const seekTo = useCallback((mmss: string | undefined) => {
     const video = videoRef.current;
-    // No recording (incomplete session) or no timestamp (a human task with no
-    // moment — ADR-024) → nothing to seek.
     if (!video || !mmss) return;
-    const target = mmssToSec(mmss);
-    if (video.currentTime === target) return; // no change → no seeking event
-    programmaticSeek.current = true;
-    video.currentTime = target;
-  }, []);
-
-  const onVideoSeeking = useCallback(() => {
-    if (programmaticSeek.current) {
-      programmaticSeek.current = false; // our own seek — keep the selection
-      return;
-    }
-    setSelected(null); // user scrubbed the player → drop the row highlight
+    video.currentTime = mmssToSec(mmss);
   }, []);
 
   // Resizable right pane (TASK-34). rightWidthRef mirrors the state so the
@@ -1018,21 +959,16 @@ function Body({
     document.body.style.userSelect = "none";
   }, []);
 
-  // ---- TASK-57 (ADR-024): Edit-mode state ----------------------------------
-  // Editing only ever touches the LIVE run (an archive is read-only). The live
-  // analysis is the source we seed the editable draft from.
+  // ---- TASK-68.1 (parent TASK-68): editing is always-on when allowed ---------
+  // There is no Edit MODE anymore — the document surface is directly editable
+  // whenever `canEdit` is true. Editing only ever touches the LIVE run (an archive
+  // is read-only); the live analysis is the source we seed the editable draft from.
   const liveAnalysis = data?.status === "ok" ? data.analysis : null;
   const viewingArchiveEarly = selectedRun !== null;
   const canEdit = !viewingArchiveEarly && liveAnalysis !== null;
-
-  // The View/Edit/Comment mode lives here (not in RightColumn) because Edit mode
-  // also drives the left pane's overview editor. Reset to View whenever editing
-  // isn't allowed (an archived/malformed run) so a mode can't leak into read-only.
-  const [mode, setMode] = useState<SessionMode>("view");
-  useEffect(() => {
-    if (!canEdit) setMode("view");
-  }, [canEdit]);
-  const editing = canEdit && mode === "edit";
+  // Kept as its own name for readability at the call sites (the document takes an
+  // `editing` prop): on the live parsed run the whole surface is editable.
+  const editing = canEdit;
 
   // The working copy of the analysis. Seeded from the live run and re-seeded when
   // the session reloads (rename / re-analysis mints a fresh liveAnalysis object).
@@ -1144,11 +1080,10 @@ function Body({
 
   // Add a blank human task at the end (origin "human", a collision-free id). Its
   // fields are seeded to schema-valid defaults (title/description are .min(1) in
-  // the stored schema) that the user then edits with the TASK-57 inline editors.
+  // the stored schema) that the user then edits with the inline editors.
   // timestamp/screenshot_timestamp/screen_context/screenshot are omitted (relaxed
-  // optionals) — a human task with no frame renders without an image ("no
-  // preview") and carries no AI baseline (so no revert-to-AI marker). Select it so
-  // it's obvious which card just appeared.
+  // optionals) — a human task with no frame renders without an image ("no preview")
+  // and carries no AI baseline (so no revert-to-AI marker).
   const addTask = useCallback(() => {
     const cur = draftRef.current;
     if (!cur) return;
@@ -1163,13 +1098,10 @@ function Body({
     const next: StoredAnalysisResult = { ...cur, tasks: [...cur.tasks, newTask] };
     setDraft(next);
     persist(next);
-    setSelected(next.tasks.length - 1);
   }, [persist]);
 
-  // Delete a task by index (confirmed in the card). The orphaned screenshots/*.png
-  // is left unreferenced on disk — harmless, not pruned in v1.1 (ADR-025). Keep the
-  // selection coherent: drop it if the removed row was selected, shift it left if a
-  // row before it went away.
+  // Delete a task by index (confirmed in the section). The orphaned screenshots/*.png
+  // is left unreferenced on disk — harmless, not pruned (ADR-025).
   const deleteTask = useCallback(
     (index: number) => {
       const cur = draftRef.current;
@@ -1180,11 +1112,6 @@ function Body({
       };
       setDraft(next);
       persist(next);
-      setSelected((sel) => {
-        if (sel === null) return null;
-        if (sel === index) return null;
-        return sel > index ? sel - 1 : sel;
-      });
     },
     [persist],
   );
@@ -1192,8 +1119,7 @@ function Body({
   // Reorder via up/down: swap a task with its neighbour (dependency-free — no dnd
   // library; the list is short and up/down stays keyboard-accessible). Array order
   // = display order = report.md order. Each task keeps its own `screenshot`
-  // filename, so frames stay correct after the move (ADR-025). Selection follows
-  // the swap so the highlight stays on the same task.
+  // filename, so frames stay correct after the move (ADR-025).
   const moveTask = useCallback(
     (index: number, dir: -1 | 1) => {
       const cur = draftRef.current;
@@ -1205,248 +1131,15 @@ function Body({
       const next: StoredAnalysisResult = { ...cur, tasks };
       setDraft(next);
       persist(next);
-      setSelected((sel) => {
-        if (sel === index) return target;
-        if (sel === target) return index;
-        return sel;
-      });
     },
     [persist],
   );
 
-  // ---- TASK-59 (ADR-024): Comment-mode state -------------------------------
-  // Comments are a SEPARATE sidecar (comments.json) — Comment mode never touches
-  // tasks.json / report.md (all writes below go through writeComments only). Loaded
-  // once per session on the live run; re-read on reload (rename / re-analysis).
-  const commenting = canEdit && mode === "comment";
-  const [comments, setComments] = useState<Comment[]>([]);
-  const commentsRef = useRef(comments);
-  useEffect(() => {
-    commentsRef.current = comments;
-  }, [comments]);
-
-  useEffect(() => {
-    if (!canEdit) {
-      setComments([]);
-      return;
-    }
-    let cancelled = false;
-    workspace
-      .getDirectoryHandle(name)
-      .then((dir) => readComments(dir))
-      .then((cs) => {
-        if (!cancelled) setComments(cs);
-      })
-      .catch(() => {
-        // A missing/unreadable comments.json is a valid "no comments" state.
-        if (!cancelled) setComments([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [canEdit, workspace, name, reloadKey]);
-
-  // Serialize comment writes exactly like the edit save chain, so rapid add/edit/
-  // delete can't race. Writes ONLY comments.json — never the analysis (AC#5).
-  const commentSaveChain = useRef<Promise<void>>(Promise.resolve());
-  const persistComments = useCallback(
-    (next: Comment[]) => {
-      commentSaveChain.current = commentSaveChain.current
-        .catch(() => {})
-        .then(async () => {
-          const dir = await workspace.getDirectoryHandle(name);
-          await writeComments(dir, next);
-        });
-    },
-    [workspace, name],
-  );
-
-  const addComment = useCallback(
-    (partial: Omit<Comment, "id" | "createdAt">) => {
-      const cur = commentsRef.current;
-      const comment: Comment = {
-        ...partial,
-        id: mintCommentId(cur),
-        createdAt: new Date().toISOString(),
-      };
-      const next = [...cur, comment];
-      setComments(next);
-      persistComments(next);
-    },
-    [persistComments],
-  );
-
-  const editComment = useCallback(
-    (id: string, body: string) => {
-      const next = commentsRef.current.map((c) =>
-        c.id === id ? { ...c, body } : c,
-      );
-      setComments(next);
-      persistComments(next);
-    },
-    [persistComments],
-  );
-
-  const deleteComment = useCallback(
-    (id: string) => {
-      const next = commentsRef.current.filter((c) => c.id !== id);
-      setComments(next);
-      persistComments(next);
-    },
-    [persistComments],
-  );
-
-  // The pending text selection awaiting a comment (drives the floating composer).
-  const [pendingAnchor, setPendingAnchor] = useState<PendingAnchor | null>(null);
-  useCommentSelection(commenting, setPendingAnchor);
-  // Leaving Comment mode drops any half-typed composer.
-  useEffect(() => {
-    if (!commenting) setPendingAnchor(null);
-  }, [commenting]);
-
-  const commitAnchorComment = useCallback(
-    (body: string) => {
-      if (!pendingAnchor) return;
-      addComment({
-        kind: "anchor",
-        taskId: pendingAnchor.taskId,
-        field: pendingAnchor.field,
-        quote: pendingAnchor.quote,
-        body,
-      });
-      window.getSelection()?.removeAllRanges();
-      setPendingAnchor(null);
-    },
-    [pendingAnchor, addComment],
-  );
-
-  // Clicking a comment scrolls to its anchored task card + a brief flash ring
-  // (nice-to-have). A global / overview / orphan comment has no task to focus.
-  const focusComment = useCallback((comment: Comment) => {
-    if (!comment.taskId) return;
-    const el = document.getElementById(taskCardDomId(comment.taskId));
-    if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-    el.classList.add("ring-1", "ring-inset", "ring-foreground/25");
-    window.setTimeout(
-      () => el.classList.remove("ring-1", "ring-inset", "ring-foreground/25"),
-      1200,
-    );
-  }, []);
-
-  // ---- TASK-60 (ADR-024): the comment→AI-revise loop -----------------------
-  // Two flavors, both from Comment mode when comments exist: a text-only revise
-  // (fast/cheap, no video — /api/revise) and a re-run-with-video (the full
-  // grounded pipeline + the comments, /api/analyze). Both write a NEW run
-  // (archiving the prior run + its comments), so on success we clear the local
-  // comments and ask the parent to reload. Cancellable via an AbortController.
-  const [revise, setRevise] = useState<ReviseUiState>({ status: "idle" });
-  const reviseAbort = useRef<AbortController | null>(null);
-  useEffect(
-    () => () => reviseAbort.current?.abort(), // abort a run in flight on unmount
-    [],
-  );
-
-  const beginReviseFlow = useCallback(
-    (flavor: "text" | "video", config: AnalysisConfig) => {
-      // The current stored analysis (reflects saved edits); nothing to revise
-      // without it or without comments.
-      const source = draft ?? liveAnalysis;
-      const current = commentsRef.current;
-      if (!source || current.length === 0) return;
-      if (revise.status === "running") return;
-
-      const controller = new AbortController();
-      reviseAbort.current = controller;
-      setRevise({ status: "running", flavor });
-
-      void (async () => {
-        try {
-          const dir = await workspace.getDirectoryHandle(name);
-          if (flavor === "text") {
-            // Text-only revise: the chosen model + language thread into /api/revise
-            // (mode is n/a for a single text call, so the dialog never asked).
-            await runRevise({
-              sessionDir: dir,
-              sessionName: name,
-              result: source,
-              comments: current,
-              model: config.model,
-              language: config.language,
-              signal: controller.signal,
-            });
-          } else {
-            // Re-run WITH video: a full analyze pipeline + the comments, so the
-            // full config (model + mode + language) threads into /api/analyze.
-            await runAnalyze({
-              sessionDir: dir,
-              sessionName: name,
-              model: config.model,
-              mode: config.mode,
-              language: config.language,
-              signal: controller.signal,
-              revise: { result: source, comments: current },
-              onProgress: () => {
-                // A coarse busy state is enough here — the button shows "Re-running…".
-              },
-            });
-          }
-          if (controller.signal.aborted) return;
-          setRevise({ status: "idle" });
-          setComments([]); // the new run starts comment-free (archived with the old)
-          setMode("view");
-          onRunReplaced();
-        } catch (err) {
-          if (err instanceof DOMException && err.name === "AbortError") {
-            setRevise({ status: "idle" });
-            return;
-          }
-          const message =
-            err instanceof AnalyzeFlowError
-              ? err.message
-              : err instanceof Error
-                ? err.message
-                : String(err);
-          setRevise({ status: "error", message });
-        }
-      })();
-    },
-    [draft, liveAnalysis, revise.status, workspace, name, onRunReplaced],
-  );
-
-  const cancelRevise = useCallback(() => {
-    reviseAbort.current?.abort();
-    setRevise({ status: "idle" });
-  }, []);
-
-  // TASK-61 — both revise actions now go through the SAME pre-analysis config gate
-  // as a fresh analysis (always ask model/language before spending on a call). The
-  // ReviseBar buttons open this dialog; confirming runs beginReviseFlow with the
-  // chosen config. null = closed.
-  const [reviseConfig, setReviseConfig] = useState<{
-    flavor: "text" | "video";
-  } | null>(null);
-
-  // Seed the config dialog with the current run's choices so a revise defaults to
-  // how the session was last produced (model/mode/language), else the app defaults.
-  const reviseSource = draft ?? liveAnalysis;
-  const reviseDefaults = useMemo<Partial<AnalysisConfig>>(
-    () => ({
-      model: reviseSource?.run?.models?.[0],
-      mode: reviseSource?.run?.mode,
-      language: reviseSource?.run?.language,
-    }),
-    [reviseSource],
-  );
-
-  // Rough input-token budget for the TEXT-only revise cost estimate: the current
-  // tasks + comments serialized (~4 chars/token). The video revise ignores this
-  // (its cost is measured from the recording's duration instead).
-  const reviseTextTokens = useMemo(() => {
-    if (!reviseSource) return undefined;
-    const payload = JSON.stringify({ result: reviseSource, comments });
-    return Math.ceil(payload.length / 4);
-  }, [reviseSource, comments]);
+  // SEAM (sibling task — TASK-68.x): commenting was removed with the mode switcher
+  // and will return as select-to-comment directly on the document (each task
+  // section already carries `data-task-id`). Its persistence (comments-browser.ts)
+  // and the comment→AI-revise loop (run-revise.ts) remain in the codebase, unwired,
+  // for that task to reconnect — along with the parent's reload-after-revise plumbing.
 
   if (showSkeleton || data === null) return <LoadingBody />;
 
@@ -1510,112 +1203,64 @@ function Body({
     ? archiveStampFromSource(selectedRun?.source)
     : null;
 
-  // TASK-56/57 — the View/Edit/Comment switcher (and inline editing) is offered
-  // only on the LIVE run with a parsed analysis (`canEdit`, computed above with the
-  // editing state). On that run we render from the editable `draft` (which reflects
-  // saved edits) instead of the on-disk read; an archived/read-only run renders its
-  // own content untouched.
+  // TASK-68.1 — inline editing is offered only on the LIVE run with a parsed
+  // analysis (`canEdit`). On that run we render from the editable `draft` (which
+  // reflects saved edits) instead of the on-disk read; an archived/read-only run
+  // renders its own content untouched.
   const shownAnalysis = canEdit ? draft ?? activeAnalysis : activeAnalysis;
   const shownOverview = canEdit ? draft?.overview ?? activeOverview : activeOverview;
 
   return (
-    <>
-      <main
-        ref={mainRef}
-        className="grid min-h-0 flex-1"
-        style={{ gridTemplateColumns: `minmax(0,1fr) 1px ${rightWidth}px` }}
-      >
-        <PlayerPane
-          recording={data.recording}
-          showTabs={data.analysis !== null}
-          videoRef={videoRef}
-          onSeeking={onVideoSeeking}
-          workspace={workspace}
-          name={name}
-          reloadKey={reloadKey}
-          selectedSource={selectedRun?.source ?? null}
-          onSelectRun={onSelectRun}
-          liveEdited={liveEdited}
-        />
-        <ResizeHandle onPointerDown={startResize} />
-        <RightColumn
-          analysis={shownAnalysis}
-          malformed={activeMalformed}
-          reportFile={activeReportFile}
-          screenshotsDir={activeScreenshotsDir}
-          loading={runLoading}
-          viewingArchive={viewingArchive}
-          onGoToLatest={() => onSelectRun(null)}
-          displayName={data.displayName}
-          downloadStamp={activeDownloadStamp}
-          canEdit={canEdit}
-          mode={mode}
-          onModeChange={setMode}
-          editing={editing}
-          baselineById={baselineById}
-          onTaskChange={updateTask}
-          onAddTask={addTask}
-          onDeleteTask={deleteTask}
-          onMoveTask={moveTask}
-          reloadToken={savedNonce}
-          workspace={workspace}
-          name={name}
-          selected={selected}
-          onSelect={setSelected}
-          onSeek={seekTo}
-          commenting={commenting}
-          comments={comments}
-          pendingAnchor={pendingAnchor}
-          overview={shownOverview}
-          onOverviewChange={updateOverview}
-          overviewBaseline={baseline?.overview}
-          onAddGlobalComment={(body) => addComment({ kind: "global", body })}
-          onEditComment={editComment}
-          onDeleteComment={deleteComment}
-          onFocusComment={focusComment}
-          reviseState={revise}
-          reviseBlocked={otherAnalysisActive}
-          onProcessComments={() => setReviseConfig({ flavor: "text" })}
-          onReRunWithVideo={() => setReviseConfig({ flavor: "video" })}
-          onCancelRevise={cancelRevise}
-        />
-      </main>
-
-      {/* The floating comment composer for a live text selection (TASK-59). */}
-      {commenting && pendingAnchor && (
-        <CommentComposer
-          anchor={pendingAnchor}
-          onSave={commitAnchorComment}
-          onCancel={() => setPendingAnchor(null)}
-        />
-      )}
-
-      {/* TASK-61 — the pre-analysis config gate for BOTH revise actions, reusing
-          the same dialog as a fresh analysis. "Process comments" opens the
-          text-only variant (model + language, no mode, cheap text cost);
-          "Re-run with video" opens the full config (model + mode + language,
-          full-video cost). Confirming threads the choice into beginReviseFlow. */}
-      <AnalysisConfigDialog
-        variant={reviseConfig?.flavor === "video" ? "revise-video" : "revise-text"}
-        sessionName={reviseConfig ? name : null}
-        defaults={reviseDefaults}
-        textInputTokens={reviseTextTokens}
-        onStart={(config) => {
-          const flavor = reviseConfig?.flavor;
-          setReviseConfig(null);
-          if (flavor) beginReviseFlow(flavor, config);
-        }}
-        onClose={() => setReviseConfig(null)}
+    <main
+      ref={mainRef}
+      className="grid min-h-0 flex-1"
+      style={{ gridTemplateColumns: `minmax(0,1fr) 1px ${rightWidth}px` }}
+    >
+      <PlayerPane
+        recording={data.recording}
+        showTabs={data.analysis !== null}
+        videoRef={videoRef}
+        workspace={workspace}
+        name={name}
+        reloadKey={reloadKey}
+        selectedSource={selectedRun?.source ?? null}
+        onSelectRun={onSelectRun}
+        liveEdited={liveEdited}
       />
-    </>
+      <ResizeHandle onPointerDown={startResize} />
+      <RightColumn
+        analysis={shownAnalysis}
+        malformed={activeMalformed}
+        reportFile={activeReportFile}
+        screenshotsDir={activeScreenshotsDir}
+        loading={runLoading}
+        viewingArchive={viewingArchive}
+        onGoToLatest={() => onSelectRun(null)}
+        displayName={data.displayName}
+        downloadStamp={activeDownloadStamp}
+        editing={editing}
+        baselineById={baselineById}
+        onTaskChange={updateTask}
+        onAddTask={addTask}
+        onDeleteTask={deleteTask}
+        onMoveTask={moveTask}
+        reloadToken={savedNonce}
+        workspace={workspace}
+        name={name}
+        onSeek={seekTo}
+        overview={shownOverview}
+        onOverviewChange={updateOverview}
+        overviewBaseline={baseline?.overview}
+      />
+    </main>
   );
 }
 
-// Right column of a readable session: a Tasks | Markdown switcher (only when a
-// report.md exists) over the pane it toggles. Tasks is the interactive list
-// (TASK-18); Markdown renders report.md (TASK-34). A session with no report.md
-// (incomplete — ADR-008) shows the task list alone, no switcher. The view state
-// lives here so switching never disturbs the player or the task selection.
+// The right column: the interactive report document (TASK-68.1) over a thin header
+// row. The old Tasks/Markdown switcher and View/Edit/Comment mode switcher are gone
+// (parent TASK-68) — there is one always-editable document surface (ReportDocument).
+// The header row carries the download kebab (Save as MD/JSON) and, on an archived
+// run, a quiet "Go to latest run" button; it's omitted when there's nothing to show.
 function RightColumn({
   analysis,
   malformed,
@@ -1626,9 +1271,6 @@ function RightColumn({
   onGoToLatest,
   displayName,
   downloadStamp,
-  canEdit,
-  mode,
-  onModeChange,
   editing,
   baselineById,
   onTaskChange,
@@ -1638,234 +1280,95 @@ function RightColumn({
   reloadToken,
   workspace,
   name,
-  selected,
-  onSelect,
   onSeek,
-  commenting,
-  comments,
-  pendingAnchor,
   overview,
   onOverviewChange,
   overviewBaseline,
-  onAddGlobalComment,
-  onEditComment,
-  onDeleteComment,
-  onFocusComment,
-  reviseState,
-  reviseBlocked,
-  onProcessComments,
-  onReRunWithVideo,
-  onCancelRevise,
 }: {
-  // The ACTIVE run's content (TASK-51): the latest, or a selected archive. On the
-  // live editable run this is the in-memory draft (reflects saved edits).
+  /** The ACTIVE run's content (TASK-51): the latest draft, or a selected archive. */
   analysis: StoredAnalysisResult | null;
   malformed: boolean;
-  // The report to render in the Markdown tab (report.md or report-<stamp>.md), or
-  // null when the active run has none — the switcher then hides.
+  /** The active run's report.md / report-<stamp>.md, for the "Save as MD" download
+   *  (null when the run has none — the document still renders from tasks). */
   reportFile: string | null;
-  // The frames folder the Markdown view resolves images against (screenshots/ or a
-  // run's screenshots-<stamp>/ — ADR-023).
+  /** The active run's frames folder (screenshots/ or screenshots-<stamp>/). */
   screenshotsDir: string;
-  // True while an archived run is still loading — show a placeholder, not the
-  // previous run's list.
+  /** True while an archived run's tasks are still loading — show a placeholder. */
   loading: boolean;
-  // TASK-51 follow-up — a non-latest (archived) run is selected. Read-only, so
-  // there's no mode switcher; instead the header offers a "Go to latest run"
-  // affordance (onGoToLatest clears the selection back to the live run).
+  /** A non-latest (archived) run is selected — read-only, with a "back to latest". */
   viewingArchive: boolean;
   onGoToLatest: () => void;
-  // Download kebab — the session display name (for the download filename slug) + the
-  // archived-run stamp disambiguator (null for the latest). Fed to the download
-  // kebab on the far right of the header row.
+  /** The session display name (download filename slug) + the archived-run stamp. */
   displayName: string;
   downloadStamp: string | null;
-  // TASK-56 — the live run with a parsed analysis: offer the View/Edit/Comment
-  // switcher. False for an archived or malformed run (read-only, View only).
-  canEdit: boolean;
-  // TASK-57 — the mode is owned by Body (it also drives the overview editor), so
-  // the switcher here is controlled.
-  mode: SessionMode;
-  onModeChange: (next: SessionMode) => void;
-  // Edit mode is active (canEdit && mode === "edit") — turn the rows editable.
+  /** Inline editing is allowed (the live run with a parsed analysis). */
   editing: boolean;
-  // AI baseline per task id, for the "edited" markers + revert (empty until the
-  // first edit creates the baseline).
+  /** AI baseline per task id, for the per-field edited dots + revert. */
   baselineById: Map<string, StoredVellumTask>;
-  // Persist a field edit on a task (by list index). Autosaved by Body.
   onTaskChange: (index: number, patch: Partial<StoredVellumTask>) => void;
-  // TASK-58 — structural edits (Edit mode only), all autosaved by Body via the
-  // non-archiving save path.
   onAddTask: () => void;
   onDeleteTask: (index: number) => void;
   onMoveTask: (index: number, dir: -1 | 1) => void;
-  // Bumped after each save so the Markdown pane re-reads report.md (tasks.json ↔
-  // report.md stay in sync on screen).
+  /** Bumped after each save so the document re-reads its frame map if needed. */
   reloadToken: number;
   workspace: FileSystemDirectoryHandle;
   name: string;
-  selected: number | null;
-  onSelect: (index: number) => void;
   onSeek: (mmss: string | undefined) => void;
-  // TASK-59 — Comment mode (canEdit && mode === "comment"): the task list becomes
-  // selectable + highlighted, and the comments panel docks below the panes.
-  commenting: boolean;
-  comments: Comment[];
-  /** The OPEN composer's anchor (the in-progress selection), so the field it targets
-   *  can show its pending yellow highlight on the page. Null when none is open. */
-  pendingAnchor: PendingAnchor | null;
-  /** The active overview text — rendered as a header block at the top of the Tasks
-   *  pane (TASK-61 layout) and used to resolve overview-anchor comments below. On
-   *  the live editable run this reflects saved edits (the draft's overview). */
+  /** The active overview (the draft's when editing). */
   overview: string;
-  /** TASK-57 — Edit mode: commit an inline edit of the overview (autosaved by Body). */
   onOverviewChange: (next: string) => void;
-  /** The AI baseline overview, for the "edited" marker + revert (undefined = none). */
   overviewBaseline: string | undefined;
-  onAddGlobalComment: (body: string) => void;
-  onEditComment: (id: string, body: string) => void;
-  onDeleteComment: (id: string) => void;
-  onFocusComment: (comment: Comment) => void;
-  // TASK-60 — the comment→AI-revise actions + their busy/error state.
-  reviseState: ReviseUiState;
-  /** An analysis run is active elsewhere — block starting a revise. */
-  reviseBlocked: boolean;
-  onProcessComments: () => void;
-  onReRunWithVideo: () => void;
-  onCancelRevise: () => void;
 }) {
-  const [view, setView] = useState<SessionPaneView>("tasks");
-  const hasReport = reportFile !== null;
-  const active = hasReport ? view : "tasks";
-
-  // Markdown is a read-only rendered report — you can't edit or comment there
-  // (the overview + tasks it contains are already baked into the prose). When the
-  // Markdown tab is open, fall back to View so no edit/comment affordance (or the
-  // now-hidden mode switcher) leaks into it. Switching back to Tasks starts from
-  // View — we don't preserve the prior mode across the Markdown visit (simpler,
-  // predictable).
-  useEffect(() => {
-    if (active === "markdown" && mode !== "view") onModeChange("view");
-  }, [active, mode, onModeChange]);
-
-  // Keep both panes mounted and toggle them with `hidden`, instead of swapping
-  // one for the other — switching Tasks<->Markdown used to unmount ReportView,
-  // so each visit re-read report.md + every screenshot and re-parsed the
-  // Markdown. Mounted once, it stays warm. Markdown is still lazy: it doesn't
-  // mount until the first time it's opened, so a session you never expand pays
-  // nothing.
-  const [markdownVisited, setMarkdownVisited] = useState(false);
-  useEffect(() => {
-    if (active === "markdown") setMarkdownVisited(true);
-  }, [active]);
-
-  // The download kebab shows whenever the active run has anything to
-  // export (a report to save as MD, or a parsed analysis to save as JSON). This
-  // also keeps the header row present on a run that has neither a switcher nor a
-  // report but does have tasks, so the kebab is reachable on every version.
+  // The header row shows whenever there's something to put in it: a run to export
+  // (report.md or a parsed analysis → the download kebab) or an archived run to
+  // leave (Go to latest). Otherwise it's omitted so the document owns the column.
   const canDownload = reportFile !== null || analysis !== null;
+  const showHeader = canDownload || viewingArchive;
 
   return (
     <div className="flex min-h-0 flex-col">
-      {(canEdit || hasReport || viewingArchive || canDownload) && (
-        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-4 pt-3 pb-3">
-          {/* Content switcher (Tasks | Markdown) on the LEFT; the empty span keeps
-              the right-side affordances pushed right via justify-between when
-              there's no report to switch. */}
-          {hasReport ? (
-            <ViewSwitcher value={view} onChange={setView} />
-          ) : (
-            <span aria-hidden />
+      {showHeader && (
+        <div className="flex shrink-0 items-center justify-end gap-2 border-b border-border px-4 pt-3 pb-3">
+          {viewingArchive && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground hover:text-foreground"
+              onClick={onGoToLatest}
+            >
+              Go to latest run
+            </Button>
           )}
-          {/* RIGHT side, as one group so the kebab always sits at the far right.
-              On the live editable run: the icon-only View | Edit | Comment switcher
-              (Tasks tab only — Markdown is read-only). On a non-latest archived run
-              (read-only, no switcher): a quiet text button back to the latest run.
-              The switcher/back-button are mutually exclusive (canEdit is false while
-              an archive is viewed); the download button renders on BOTH. */}
-          <div className="flex items-center gap-2">
-            {canEdit && active === "tasks" && (
-              <ModeSwitcher value={mode} onChange={onModeChange} />
-            )}
-            {viewingArchive && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="text-muted-foreground hover:text-foreground"
-                onClick={onGoToLatest}
-              >
-                Go to latest run
-              </Button>
-            )}
-            <DownloadMenu
-              reportFile={reportFile}
-              analysis={analysis}
-              workspace={workspace}
-              name={name}
-              displayName={displayName}
-              stamp={downloadStamp}
-            />
-          </div>
+          <DownloadMenu
+            reportFile={reportFile}
+            analysis={analysis}
+            workspace={workspace}
+            name={name}
+            displayName={displayName}
+            stamp={downloadStamp}
+          />
         </div>
       )}
-      {/* Archived-run switch (TASK-51): a brief placeholder while its tasks load,
-          over both hidden panes. */}
-      {loading && <RunLoading />}
-      <div
-        hidden={loading || active !== "tasks"}
-        className="flex min-h-0 flex-1 flex-col"
-      >
-        <TaskListPane
+      {loading ? (
+        <RunLoading />
+      ) : (
+        <ReportDocument
           analysis={analysis}
           malformed={malformed}
-          selected={selected}
-          onSelect={onSelect}
-          onSeek={onSeek}
+          overview={overview}
           editing={editing}
           baselineById={baselineById}
+          overviewBaseline={overviewBaseline}
+          onOverviewChange={onOverviewChange}
           onTaskChange={onTaskChange}
           onAddTask={onAddTask}
           onDeleteTask={onDeleteTask}
           onMoveTask={onMoveTask}
-          commenting={commenting}
-          comments={comments}
-          pendingAnchor={pendingAnchor}
-          overview={overview}
-          onOverviewChange={onOverviewChange}
-          overviewBaseline={overviewBaseline}
-        />
-      </div>
-      {markdownVisited && reportFile && (
-        <div
-          hidden={loading || active !== "markdown"}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ReportView
-            workspace={workspace}
-            name={name}
-            reportFile={reportFile}
-            screenshotsDir={screenshotsDir}
-            reloadToken={reloadToken}
-          />
-        </div>
-      )}
-      {/* TASK-59 — the comments panel docks below the panes in Comment mode:
-          tasks/overview on top, comments accumulating below (the plannotator
-          margin feel). Its tasks come from the live analysis (AnchorTarget). */}
-      {commenting && (
-        <CommentsPanel
-          comments={comments}
-          tasks={analysis?.tasks ?? []}
-          overview={overview}
-          onAddGlobal={onAddGlobalComment}
-          onEdit={onEditComment}
-          onDelete={onDeleteComment}
-          onFocus={onFocusComment}
-          reviseState={reviseState}
-          reviseBlocked={reviseBlocked}
-          onProcessComments={onProcessComments}
-          onReRunWithVideo={onReRunWithVideo}
-          onCancelRevise={onCancelRevise}
+          onSeek={onSeek}
+          workspace={workspace}
+          name={name}
+          screenshotsDir={screenshotsDir}
+          reloadToken={reloadToken}
         />
       )}
     </div>
@@ -1885,172 +1388,6 @@ function RunLoading() {
         </div>
       ))}
     </div>
-  );
-}
-
-type SessionPaneView = "tasks" | "markdown";
-
-/** One segment of a SegmentedSwitcher: a stable id, its label, and an optional
- *  Lucide icon (the right pane uses icons; the left pane's Overview/Details don't). */
-interface Segment<T extends string> {
-  id: T;
-  label: string;
-  icon?: typeof ListChecks;
-}
-
-// A compact, hug-content segmented control (ADR-004): a muted track with the
-// active segment lifted onto a raised pill; the rest stay muted text and rise to
-// full contrast on hover. 150ms ease-out (ADR-005). Generic so the right pane's
-// Tasks | Markdown and its icon-only View | Edit | Comment mode switcher share
-// one styling source of truth.
-//
-// `iconOnly` is the mode switcher's variant. The ACTIVE segment shows its icon +
-// label inline; a resting non-active segment is icon-only and shows its label as a
-// Tooltip on hover (the same Tooltip used elsewhere) — no inline reveal. aria-label
-// keeps every segment accessible. The active label span is the 20px text line box,
-// so the switcher stays a fixed 28px, level with the labelled Tasks | Markdown one.
-function SegmentedSwitcher<T extends string>({
-  segments,
-  value,
-  onChange,
-  iconOnly = false,
-}: {
-  segments: Segment<T>[];
-  value: T;
-  onChange: (next: T) => void;
-  iconOnly?: boolean;
-}) {
-  return (
-    <div className="inline-flex items-center gap-0.5 rounded-lg bg-muted p-0.5">
-      {segments.map((segment) => {
-        const active = value === segment.id;
-        const icon = segment.icon && (
-          <segment.icon className="size-4 shrink-0" strokeWidth={1.5} />
-        );
-
-        // Icon-only (the mode switcher). The ACTIVE segment shows its icon + label
-        // inline (a 20px line box, so the box matches the labelled switcher's 28px
-        // height). A non-active segment is icon-only and surfaces its label as a
-        // Tooltip on hover — no inline reveal. aria-label keeps it accessible.
-        if (iconOnly) {
-          if (active) {
-            return (
-              <button
-                key={segment.id}
-                type="button"
-                onClick={() => onChange(segment.id)}
-                aria-pressed
-                aria-label={segment.label}
-                className="inline-flex items-center gap-1.5 rounded-md bg-background px-2 py-1 text-sm font-medium text-foreground shadow-sm transition-colors duration-150 ease-out active:opacity-80"
-              >
-                {icon}
-                <span className="whitespace-nowrap">{segment.label}</span>
-              </button>
-            );
-          }
-          return (
-            <Tooltip key={segment.id}>
-              <TooltipTrigger
-                render={
-                  <button
-                    type="button"
-                    onClick={() => onChange(segment.id)}
-                    aria-pressed={false}
-                    aria-label={segment.label}
-                    className="inline-flex items-center rounded-md px-2 py-1 text-sm font-medium text-muted-foreground transition-colors duration-150 ease-out hover:text-foreground active:opacity-80"
-                  />
-                }
-              >
-                {icon}
-              </TooltipTrigger>
-              <TooltipContent>{segment.label}</TooltipContent>
-            </Tooltip>
-          );
-        }
-
-        return (
-          <button
-            key={segment.id}
-            type="button"
-            onClick={() => onChange(segment.id)}
-            aria-pressed={active}
-            className={cn(
-              "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-sm font-medium transition-colors duration-150 ease-out active:opacity-80",
-              active
-                ? "bg-background text-foreground shadow-sm"
-                : "text-muted-foreground hover:text-foreground",
-            )}
-          >
-            {icon}
-            {segment.label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-const RIGHT_PANE_SEGMENTS: Segment<SessionPaneView>[] = [
-  { id: "tasks", label: "Tasks", icon: ListChecks },
-  { id: "markdown", label: "Markdown", icon: FileText },
-];
-
-// The right pane's Tasks | Markdown switcher (TASK-34) — a thin wrapper over the
-// shared SegmentedSwitcher.
-function ViewSwitcher({
-  value,
-  onChange,
-}: {
-  value: SessionPaneView;
-  onChange: (next: SessionPaneView) => void;
-}) {
-  return (
-    <SegmentedSwitcher
-      segments={RIGHT_PANE_SEGMENTS}
-      value={value}
-      onChange={onChange}
-    />
-  );
-}
-
-// TASK-56 — the session's editing mode (ADR-024). View is the current read-only
-// behavior; Edit and Comment are scaffolded here (same read-only body for now) and
-// filled by TASK-57/58/59. Only offered on the live run (see RightColumn.canEdit).
-type SessionMode = "view" | "edit" | "comment";
-
-// TASK-60 — the comment→AI-revise UI state (idle / a running flavor / an error).
-type ReviseUiState =
-  | { status: "idle" }
-  | { status: "running"; flavor: "text" | "video" }
-  | { status: "error"; message: string };
-
-const MODE_SEGMENTS: Segment<SessionMode>[] = [
-  { id: "view", label: "View", icon: Eye },
-  { id: "edit", label: "Edit", icon: Pencil },
-  { id: "comment", label: "Comment", icon: MessageSquareText },
-];
-
-// The View | Edit | Comment mode switcher — the same monochrome SegmentedSwitcher
-// as the Tasks | Markdown pane (ADR-004), rendered ICON-ONLY (thin Lucide Eye /
-// Pencil / MessageSquareText, ADR-005) at the SAME segment height as the labelled
-// switcher. The active segment shows its label inline; the others are icon-only
-// and reveal their label as a Tooltip on hover.
-// Validated in both themes (ADR-019): its track/pill read off the theme tokens,
-// no hardcoded colors.
-function ModeSwitcher({
-  value,
-  onChange,
-}: {
-  value: SessionMode;
-  onChange: (next: SessionMode) => void;
-}) {
-  return (
-    <SegmentedSwitcher
-      segments={MODE_SEGMENTS}
-      value={value}
-      onChange={onChange}
-      iconOnly
-    />
   );
 }
 
@@ -2085,7 +1422,6 @@ function PlayerPane({
   recording,
   showTabs,
   videoRef,
-  onSeeking,
   workspace,
   name,
   reloadKey,
@@ -2099,8 +1435,6 @@ function PlayerPane({
    *  vanishes mid-switch. */
   showTabs: boolean;
   videoRef: React.RefObject<HTMLVideoElement | null>;
-  /** Fires on every seek — used to drop the row selection on a manual scrub. */
-  onSeeking: () => void;
   workspace: FileSystemDirectoryHandle;
   name: string;
   /** Reload token — re-reads run history when the view reloads (TASK-48). */
@@ -2128,7 +1462,6 @@ function PlayerPane({
             ref={videoRef}
             src={objectUrl}
             controls
-            onSeeking={onSeeking}
             className="aspect-video w-full rounded-md border border-border bg-black"
           />
         ) : (
@@ -2149,86 +1482,6 @@ function PlayerPane({
         </div>
       )}
     </div>
-  );
-}
-
-// The analysis summary (unchanged from the original Overview section). A parsed
-// AnalysisResult always carries an overview (schema-required), so the empty
-// branch only guards a defensively-empty string.
-function OverviewPanel({
-  overview,
-  editing,
-  onChange,
-  baseline,
-  commenting,
-  comments,
-  pendingQuote,
-}: {
-  overview: string;
-  // TASK-57 — Edit mode: the overview is inline-editable (multi-line), diffed
-  // against the AI baseline for a quiet "edited" marker + revert.
-  editing: boolean;
-  onChange: (next: string) => void;
-  baseline: string | undefined;
-  // TASK-59 — Comment mode: the overview is selectable + shows comment highlights.
-  commenting: boolean;
-  comments: Comment[];
-  // The in-progress composer's quote when it anchors to the overview — its pending
-  // yellow highlight on the page.
-  pendingQuote?: string;
-}) {
-  if (commenting) {
-    return (
-      <p className="text-[13px] leading-relaxed text-muted-foreground">
-        {overview ? (
-          <CommentableText
-            text={overview}
-            field="overview"
-            comments={comments}
-            pendingQuote={pendingQuote}
-          />
-        ) : (
-          "No overview was written for this session."
-        )}
-      </p>
-    );
-  }
-
-  if (editing) {
-    const edited = baseline !== undefined && overview !== baseline;
-    return (
-      <div className="group/field flex items-start gap-1">
-        <span className="min-w-0 flex-1">
-          <InlineTextarea
-            value={overview}
-            ariaLabel="Session overview"
-            className="text-[13px] leading-relaxed text-muted-foreground"
-            onCommit={onChange}
-          />
-        </span>
-        <span className="mt-0.5">
-          <EditMarker
-            edited={edited}
-            onRevert={() => {
-              if (baseline !== undefined) onChange(baseline);
-            }}
-          />
-        </span>
-      </div>
-    );
-  }
-
-  if (!overview) {
-    return (
-      <p className="text-[13px] leading-relaxed text-muted-foreground">
-        No overview was written for this session.
-      </p>
-    );
-  }
-  return (
-    <p className="text-[13px] leading-relaxed text-muted-foreground">
-      {overview}
-    </p>
   );
 }
 
@@ -2570,170 +1823,6 @@ function compactTokens(n: number): string {
   if (n < 1000) return String(n);
   if (n < 1_000_000) return `${Math.round(n / 1000)}K`;
   return `${(n / 1_000_000).toFixed(1)}M`;
-}
-
-// Right column: the dense, scrollable, clickable task list. Selecting a row seeks
-// the player to where the task was *discussed*; clicking a row's "visible"
-// timestamp seeks to where it's *visible* (ADR-013). Thumbnails were dropped
-// (TASK-33 follow-up) — too small to read; the frames stay in the report.
-function TaskListPane({
-  analysis,
-  malformed,
-  selected,
-  onSelect,
-  onSeek,
-  editing,
-  baselineById,
-  onTaskChange,
-  onAddTask,
-  onDeleteTask,
-  onMoveTask,
-  commenting,
-  comments,
-  pendingAnchor,
-  overview,
-  onOverviewChange,
-  overviewBaseline,
-}: {
-  analysis: StoredAnalysisResult | null;
-  malformed: boolean;
-  // Selection lives in Body so a manual video scrub can clear it (a task click
-  // both selects and seeks; a scrub deselects).
-  selected: number | null;
-  onSelect: (index: number) => void;
-  onSeek: (mmss: string | undefined) => void;
-  // TASK-57 — Edit mode: rows become inline-editable, diffed against the baseline.
-  editing: boolean;
-  baselineById: Map<string, StoredVellumTask>;
-  onTaskChange: (index: number, patch: Partial<StoredVellumTask>) => void;
-  // TASK-58 — structural edits, offered only in Edit mode.
-  onAddTask: () => void;
-  onDeleteTask: (index: number) => void;
-  onMoveTask: (index: number, dir: -1 | 1) => void;
-  // TASK-59 — Comment mode: rows become selectable + show comment highlights.
-  commenting: boolean;
-  comments: Comment[];
-  // The OPEN composer's anchor (the in-progress selection), forwarded so the field
-  // it targets can show its pending yellow highlight on the page.
-  pendingAnchor: PendingAnchor | null;
-  // TASK-61 layout — the session overview, rendered as a header block above the
-  // task list. Editable in Edit mode / commentable in Comment mode exactly like
-  // it was in the (removed) left-pane About tab; read-only in View.
-  overview: string;
-  onOverviewChange: (next: string) => void;
-  overviewBaseline: string | undefined;
-}) {
-  const taskCount = analysis?.tasks.length ?? 0;
-  // The overview header shows whenever there IS one, or in Edit mode so an empty
-  // one can be written. Skipped for a malformed/overview-less read-only run so it
-  // never adds an empty "No overview" line above the list.
-  const showOverview = analysis !== null && (overview !== "" || editing);
-  return (
-    // TASK-33 — the pane is the app background black; cards share that black at
-    // rest (blend, no divider lines) and lighten to the sidebar gray on hover.
-    // flex-1 so it fills the right column beneath the TASK-34 switcher and scrolls
-    // internally (it used to be the grid cell directly, stretched by the grid).
-    // `comment-selection` (Comment mode only) tints the live text selection with
-    // the comment-highlight yellow — scoped so default selection is untouched.
-    <div
-      className={cn(
-        "flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto bg-background p-4",
-        commenting && "comment-selection",
-      )}
-    >
-      {/* TASK-61 layout — the overview as a quiet header block above the numbered
-          list: a small mono/uppercase label, then the summary (inline-editable in
-          Edit, commentable in Comment). A hairline separates it from the cards. */}
-      {showOverview && (
-        <div className="flex flex-col gap-2 border-b border-border/60 px-1 pb-4">
-          <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
-            Overview
-          </span>
-          <OverviewPanel
-            overview={overview}
-            editing={editing}
-            onChange={onOverviewChange}
-            baseline={overviewBaseline}
-            commenting={commenting}
-            comments={comments.filter(
-              (c) => c.kind === "anchor" && c.field === "overview",
-            )}
-            pendingQuote={
-              pendingAnchor &&
-              !pendingAnchor.taskId &&
-              pendingAnchor.field === "overview"
-                ? pendingAnchor.quote
-                : undefined
-            }
-          />
-        </div>
-      )}
-
-      {malformed && (
-        <div className="flex items-center gap-2 rounded-lg bg-sidebar px-4 py-3 text-xs text-muted-foreground">
-          <TriangleAlert className="size-3.5 shrink-0" strokeWidth={1.5} />
-          <span>
-            This session&apos;s <code className="font-mono">tasks.json</code>{" "}
-            couldn&apos;t be read. The recording still plays.
-          </span>
-        </div>
-      )}
-
-      {analysis && analysis.tasks.length > 0 ? (
-        analysis.tasks.map((task, i) => (
-          <TaskListItem
-            key={task.id ?? i}
-            task={task}
-            index={i}
-            selected={selected === i}
-            onSelect={() => {
-              onSelect(i);
-              onSeek(task.timestamp); // discussed moment
-            }}
-            onSeekVisible={() => onSeek(task.screenshot_timestamp)}
-            editing={editing}
-            baselineTask={baselineById.get(task.id)}
-            onChange={(patch) => onTaskChange(i, patch)}
-            onDelete={() => onDeleteTask(i)}
-            onMoveUp={i > 0 ? () => onMoveTask(i, -1) : undefined}
-            onMoveDown={i < taskCount - 1 ? () => onMoveTask(i, 1) : undefined}
-            commenting={commenting}
-            comments={
-              commenting
-                ? comments.filter(
-                    (c) => c.kind === "anchor" && c.taskId === task.id,
-                  )
-                : []
-            }
-            pendingAnchor={pendingAnchor}
-          />
-        ))
-      ) : (
-        !editing && (
-          <p className="px-1 py-3 text-sm text-muted-foreground">
-            {malformed
-              ? "No tasks to show."
-              : "No tasks were extracted from this recording."}
-          </p>
-        )
-      )}
-
-      {/* TASK-58 — the "add task" affordance, Edit mode only. A restrained, full-
-          width dashed-outline ghost button at the end of the list (same dashed
-          language as the unanalyzed rows); lightens to the sidebar tone on hover.
-          Monochrome, thin Lucide plus, 150ms ease-out (ADR-004/005). */}
-      {editing && (
-        <button
-          type="button"
-          onClick={onAddTask}
-          className="flex items-center justify-center gap-1.5 rounded-xl border border-dashed border-border py-3 text-sm font-medium text-muted-foreground transition-colors duration-150 ease-out hover:bg-sidebar hover:text-foreground active:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-        >
-          <Plus className="size-4" strokeWidth={1.5} />
-          Add task
-        </button>
-      )}
-    </div>
-  );
 }
 
 // A just-recorded / just-imported session: the recording plays, but nothing has
