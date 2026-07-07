@@ -507,7 +507,7 @@ function TimecodeButton({
           <button
             type="button"
             onClick={onClick}
-            className="inline-flex items-center gap-1.5 rounded-full border border-border px-2 py-px text-[10px] text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            className="inline-flex items-center gap-1.5 rounded-full border border-border px-2 py-px text-[10px] leading-none text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
         }
       >
@@ -850,7 +850,7 @@ function Pill({
   trailing?: React.ReactNode;
 }) {
   return (
-    <span className="inline-flex items-center gap-0.5 rounded-full border border-border px-2 py-px text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+    <span className="inline-flex items-center gap-0.5 rounded-full border border-border px-2 py-px text-[10px] font-medium uppercase leading-none tracking-wide text-muted-foreground">
       {children}
       {trailing}
     </span>
@@ -876,7 +876,7 @@ function PriorityPill({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-0.5 rounded-full px-2 py-px text-[10px] font-medium uppercase tracking-wide",
+        "inline-flex items-center gap-0.5 rounded-full px-2 py-px text-[10px] font-medium uppercase leading-none tracking-wide",
         PRIORITY_STYLES[priority],
       )}
     >
