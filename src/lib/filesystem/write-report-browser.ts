@@ -28,6 +28,7 @@ import {
   today,
 } from "@/lib/report/render-report";
 import { deriveScreenshotNames } from "./screenshots";
+import { findRecording } from "./recording-file";
 import { readOverrideName } from "./session-name";
 import { AI_BASELINE_NAME } from "./write-edits-browser";
 
@@ -87,7 +88,13 @@ export async function writeReportBrowser(
   // under ONE unified run stamp so a run's three archives pair by exact stamp on
   // the read side. Screenshots aren't written until further below, so screenshots/
   // here still holds the PRIOR run's frames (this is the seam Option B relies on).
-  await archivePriorRun(sessionDir);
+  //
+  // TASK-71 — a re-run-WITH-video (origin "revise-video") is the one path that can
+  // REPLACE the session recording, so snapshot the prior recording into the
+  // superseded run's archive (recording-<stamp>.webm) BEFORE the new video lands,
+  // letting each run's ZIP export resolve the exact video it analyzed. A plain
+  // analyze / text-revise shares the session recording, so it isn't snapshotted.
+  await archivePriorRun(sessionDir, validated.run?.origin === "revise-video");
 
   // Relative, forward-slash path for the recording link — the browser builds this
   // directly (no absolute path to relativize).
@@ -183,8 +190,9 @@ export async function writeRevisedRunBrowser(
   const carriedNames = derived.map((name) => (existing.has(name) ? name : undefined));
 
   // 3. Archive the prior run (report/tasks/screenshots/comments) under one stamp —
-  //    the old run keeps its OWN full frames in screenshots-<stamp>/ (ADR-023).
-  await archivePriorRun(sessionDir);
+  //    the old run keeps its OWN full frames in screenshots-<stamp>/ (ADR-023). A
+  //    text-revise re-uses the SAME recording (TASK-71), so it isn't snapshotted.
+  await archivePriorRun(sessionDir, false);
 
   // 4. Persist tasks.json in the STORED shape, pinning each task's carried frame
   //    (or none). upgrade tolerates an undefined name per task (TASK-60).
@@ -249,8 +257,17 @@ async function readScreenshots(
  * screenshots archive names match exactly. A same-second re-analysis gets a shared
  * "-N" suffix across all three (reserveRunStamp), never a per-artifact divergence.
  * First-ever run (nothing on disk) is a clean no-op.
+ *
+ * TASK-71 — `snapshotRecording` is set only by a re-run-with-video (the sole path
+ * that can swap the session recording): it copies the CURRENT recording into the
+ * superseded run's archive (recording-<stamp>.<ext>) under the same unified stamp,
+ * so the older run's ZIP export keeps the exact video it analyzed. The copy leaves
+ * recording.webm in place (the new run reads it); it's a copy, not a move.
  */
-async function archivePriorRun(dir: FileSystemDirectoryHandle): Promise<void> {
+async function archivePriorRun(
+  dir: FileSystemDirectoryHandle,
+  snapshotRecording: boolean,
+): Promise<void> {
   const reportHandle = await getFileHandleOrNull(dir, REPORT_NAME);
   const tasksHandle = await getFileHandleOrNull(dir, TASKS_NAME);
   const shotsDir = await getDirectoryHandleOrNull(dir, SCREENSHOTS_DIR);
@@ -263,6 +280,7 @@ async function archivePriorRun(dir: FileSystemDirectoryHandle): Promise<void> {
       : Date.now();
   const stamp = await reserveRunStamp(dir, archiveStamp(new Date(baseMs)));
 
+  if (snapshotRecording) await snapshotPriorRecording(dir, stamp);
   if (reportHandle) await archiveFileTo(dir, REPORT_NAME, `report-${stamp}.md`);
   if (tasksHandle) await archiveFileTo(dir, TASKS_NAME, `tasks-${stamp}.json`);
   if (shotsDir) await archiveScreenshots(dir, shotsDir, screenshotsArchiveName(stamp));
@@ -345,6 +363,22 @@ async function archiveScreenshots(
     await writeBytesFile(dest, entry.name, bytes);
   }
   await dir.removeEntry(SCREENSHOTS_DIR, { recursive: true });
+}
+
+/**
+ * TASK-71 — copy the session's current recording into `recording-<stamp>.<ext>`
+ * (the superseded run's archived video), preserving the real container extension
+ * (webm/mp4). Unlike archiveFileTo this is a COPY: recording.webm stays put for
+ * the new run. A no-op for an incomplete session with no recording (ADR-008).
+ */
+async function snapshotPriorRecording(
+  dir: FileSystemDirectoryHandle,
+  stamp: string,
+): Promise<void> {
+  const match = await findRecording(dir);
+  if (!match) return;
+  const bytes = new Uint8Array(await (await match.handle.getFile()).arrayBuffer());
+  await writeBytesFile(dir, `recording-${stamp}${match.ext}`, bytes);
 }
 
 /** Write a UTF-8 text file under `dir`, creating/overwriting it. */

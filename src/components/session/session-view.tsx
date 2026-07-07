@@ -7,6 +7,7 @@ import {
   Check,
   Copy,
   Download,
+  FileArchive,
   FileText,
   FileVideo,
   Loader2,
@@ -59,6 +60,7 @@ import {
 } from "@/lib/filesystem/write-edits-browser";
 import { readComments, writeComments } from "@/lib/filesystem/comments-browser";
 import { downloadTextFile } from "@/lib/filesystem/download";
+import { downloadRunZip } from "@/lib/filesystem/export-zip";
 import {
   mintCommentId,
   type Comment,
@@ -641,6 +643,23 @@ function DownloadMenu({
     );
   }, [analysis, base]);
 
+  // TASK-71 — the whole run (report.md + tasks.json + screenshots/ + the recording
+  // it analyzed) as one zip. Built client-side (export-zip). closeOnClick=false so
+  // the menu item stays open with a spinner while it runs and re-entry is blocked.
+  // A read/zip failure is a silent no-op, matching the MD/JSON best-effort stance.
+  const [zipping, setZipping] = useState(false);
+  const saveZip = useCallback(async () => {
+    if (zipping) return;
+    setZipping(true);
+    try {
+      await downloadRunZip({ workspace, name, displayName, stamp });
+    } catch {
+      // The run's files vanished / a read failed mid-zip — leave the view usable.
+    } finally {
+      setZipping(false);
+    }
+  }, [zipping, workspace, name, displayName, stamp]);
+
   return (
     <Menu.Root>
       <Tooltip>
@@ -680,6 +699,22 @@ function DownloadMenu({
             >
               <Braces strokeWidth={1.5} />
               Save as JSON
+            </Menu.Item>
+            {/* TASK-71 — the whole run as one zip. closeOnClick=false keeps the
+                menu open so the spinner is visible while the (possibly large)
+                recording is read + CRC32'd. */}
+            <Menu.Item
+              onClick={saveZip}
+              closeOnClick={false}
+              disabled={zipping}
+              className="flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none data-[disabled]:opacity-50 data-[highlighted]:bg-accent"
+            >
+              {zipping ? (
+                <Loader2 className="animate-spin" strokeWidth={1.5} />
+              ) : (
+                <FileArchive strokeWidth={1.5} />
+              )}
+              {zipping ? "Preparing…" : "Download run (ZIP)"}
             </Menu.Item>
           </Menu.Popup>
         </Menu.Positioner>

@@ -6,6 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { Menu } from "@base-ui/react/menu";
 import {
   CircleDashed,
+  FileArchive,
   Film,
   Loader2,
   MoreHorizontal,
@@ -47,6 +48,7 @@ import {
   writeOverrideName,
 } from "@/lib/filesystem/session-name";
 import { matchesQuery, type SessionRow } from "@/lib/filesystem/sessions";
+import { downloadRunZip } from "@/lib/filesystem/export-zip";
 
 // TASK-14 — the session list inside the sidebar. Scans the workspace via
 // useSessions and renders one row per marked session, most-recent first.
@@ -123,6 +125,27 @@ function SessionMenuItem({ session }: { session: SessionRow }) {
   const [renaming, setRenaming] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [zipping, setZipping] = useState(false);
+
+  // TASK-71 — export the session's LATEST run (stamp: null) as one zip, from the
+  // row menu. Reuses the same downloadRunZip util as the session-view header; a
+  // read/zip failure is a silent no-op (best-effort, like the header export).
+  const saveZip = useCallback(async () => {
+    if (zipping) return;
+    setZipping(true);
+    try {
+      await downloadRunZip({
+        workspace: handle,
+        name: session.name,
+        displayName: session.displayName,
+        stamp: null,
+      });
+    } catch {
+      // The run's files vanished / a read failed mid-zip — leave the list usable.
+    } finally {
+      setZipping(false);
+    }
+  }, [zipping, handle, session.name, session.displayName]);
 
   // Seed the draft from the CURRENT name each time the dialog opens, so it always
   // reflects a fresh suggested_name / prior rename without a sync effect.
@@ -287,6 +310,21 @@ function SessionMenuItem({ session }: { session: SessionRow }) {
               >
                 <Pencil strokeWidth={1.5} />
                 Rename
+              </Menu.Item>
+              {/* TASK-71 — export the latest run. closeOnClick=false keeps the
+                  menu open so the spinner shows while the recording is zipped. */}
+              <Menu.Item
+                onClick={saveZip}
+                closeOnClick={false}
+                disabled={zipping}
+                className="flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none data-[disabled]:opacity-50 data-[highlighted]:bg-accent"
+              >
+                {zipping ? (
+                  <Loader2 className="animate-spin" strokeWidth={1.5} />
+                ) : (
+                  <FileArchive strokeWidth={1.5} />
+                )}
+                {zipping ? "Preparing…" : "Download (ZIP)"}
               </Menu.Item>
               <Menu.Item
                 onClick={() => setDeleteOpen(true)}
