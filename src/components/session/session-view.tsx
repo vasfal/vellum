@@ -60,6 +60,7 @@ import {
   saveSessionEdits,
 } from "@/lib/filesystem/write-edits-browser";
 import { readComments, writeComments } from "@/lib/filesystem/comments-browser";
+import { forkRunToHead } from "@/lib/filesystem/write-report-browser";
 import { downloadTextFile } from "@/lib/filesystem/download";
 import { downloadRunZip } from "@/lib/filesystem/export-zip";
 import {
@@ -193,6 +194,30 @@ function isLiveEdited(
     }
   }
   return false;
+}
+
+// TASK-68.4 — stamp a fresh run block on a version being FORKED to a new HEAD (a
+// manual edit of a past version). Two things must hold for an honest linear
+// history:
+//   • the fork sorts NEWEST — a fresh `analyzedAt` (run-history sorts by it), so
+//     the fork shows as the latest run above the source it came from.
+//   • the fork can't inflate the session's cost — a manual fork spends no Gemini
+//     tokens (it re-uses existing content), so its telemetry is zeroed; the source
+//     archive keeps the real spend. Model / mode / language carry over for context.
+// A pre-telemetry source (no `run` block) is left blockless — run-history then sorts
+// it by the file's write time (now), which is still newest.
+function withForkedRunBlock(a: StoredAnalysisResult): StoredAnalysisResult {
+  if (!a.run) return a;
+  return {
+    ...a,
+    run: {
+      ...a.run,
+      analyzedAt: new Date().toISOString(),
+      tokensIn: 0,
+      tokensOut: 0,
+      costUsd: 0,
+    },
+  };
 }
 
 export function SessionView({ name }: { name: string }) {
@@ -917,8 +942,11 @@ function useArchivedRun(
               malformed: true,
               reportFile: null,
               // No stamp resolved on failure → fall back to the live folder; a
-              // missing frame still degrades to "no preview" (ADR-013).
+              // missing frame still degrades to "no preview" (ADR-013). A malformed
+              // load has no editable stamp, so it stays read-only (TASK-68.4).
               screenshotsDir: "screenshots",
+              stamp: null,
+              commentsFile: null,
             },
           });
         }
@@ -1023,16 +1051,36 @@ function Body({
     document.body.style.userSelect = "none";
   }, []);
 
-  // ---- TASK-68.1 (parent TASK-68): editing is always-on when allowed ---------
+  // ---- TASK-68.1 / TASK-68.4: editing is always-on when allowed --------------
   // There is no Edit MODE anymore — the document surface is directly editable
-  // whenever `canEdit` is true. Editing only ever touches the LIVE run (an archive
-  // is read-only); the live analysis is the source we seed the editable draft from.
+  // whenever `canEdit` is true. TASK-68.4 widens this from "the live run only" to
+  // "ANY parsed version": the latest live run, OR a past version that parsed AND
+  // carries a resolvable ADR-023 stamp (so it can be forked to a new HEAD). A
+  // malformed / unstamped-legacy archive stays read-only.
   const liveAnalysis = data?.status === "ok" ? data.analysis : null;
-  const viewingArchiveEarly = selectedRun !== null;
-  const canEdit = !viewingArchiveEarly && liveAnalysis !== null;
+  const viewingArchive = selectedRun !== null;
+  // The archived run's parsed payload once it has loaded (null on the live run or
+  // while the archive is still loading).
+  const archivedData = archived.status === "done" ? archived.data : null;
+  // A past version is editable/commentable only when it parsed AND has a stamp
+  // (needed to locate its frames + comments sidecar and fork it). See ArchivedRunData.
+  const archiveEditable =
+    viewingArchive && archivedData?.analysis != null && archivedData.stamp != null;
+  // The live latest run is editable whenever it parsed (unchanged from TASK-68.1).
+  const liveEditable = !viewingArchive && liveAnalysis !== null;
+  const canEdit = liveEditable || archiveEditable;
   // Kept as its own name for readability at the call sites (the document takes an
-  // `editing` prop): on the live parsed run the whole surface is editable.
+  // `editing` prop): on any editable run the whole surface is editable.
   const editing = canEdit;
+
+  // The comments sidecar of the ACTIVE run: the live comments.json for the latest
+  // run, or a past version's archived comments-<stamp>.json. null when the run
+  // isn't commentable (read-only) — nothing is loaded or persisted then.
+  const activeCommentsFile: string | null = canEdit
+    ? viewingArchive
+      ? archivedData?.commentsFile ?? null
+      : "comments.json"
+    : null;
 
   // The working copy of the analysis. Seeded from the live run and re-seeded when
   // the session reloads (rename / re-analysis mints a fresh liveAnalysis object).
@@ -1056,7 +1104,10 @@ function Body({
   const [savedNonce, setSavedNonce] = useState(0);
 
   useEffect(() => {
-    if (!canEdit) {
+    // The AI baseline + edited markers belong to the LIVE run only (tasks.ai.json).
+    // A past version isn't edited in place — the first edit forks it to a new HEAD —
+    // so there are no in-place "edited" markers to show against a baseline there.
+    if (!liveEditable) {
       setBaseline(null);
       return;
     }
@@ -1075,7 +1126,7 @@ function Body({
     return () => {
       cancelled = true;
     };
-  }, [canEdit, workspace, name, savedNonce]);
+  }, [liveEditable, workspace, name, savedNonce]);
 
   const baselineById = useMemo(() => {
     const map = new Map<string, StoredVellumTask>();
@@ -1107,11 +1158,65 @@ function Body({
     [workspace, name],
   );
 
+  // ---- TASK-68.4: forking a PAST version to a new HEAD on edit ---------------
+  // When a past version is the active run, edits must NOT touch its immutable
+  // archive. Instead the FIRST edit forks a new HEAD from it: apply the edit, stamp
+  // a fresh run block, then promote it to the latest run (archiving the current
+  // HEAD, exactly like an AI run). We read the source version's analysis + frames
+  // folder from refs so the async fork isn't racing a stale render closure.
+  const archiveAnalysisRef = useRef<StoredAnalysisResult | null>(null);
+  const archiveScreenshotsDirRef = useRef<string>("screenshots");
+  useEffect(() => {
+    archiveAnalysisRef.current = archivedData?.analysis ?? null;
+    archiveScreenshotsDirRef.current = archivedData?.screenshotsDir ?? "screenshots";
+  }, [archivedData]);
+
+  // A fork is in flight — block a second edit from forking again before the first
+  // one lands + snaps us to the (now editable in place) latest. Reset whenever the
+  // selected run changes: onRunReplaced flips us to the latest (selectedRun→null),
+  // and switching between archives should re-arm the guard too.
+  const forkingRef = useRef(false);
+  useEffect(() => {
+    forkingRef.current = false;
+  }, [selectedRun]);
+
+  const forkArchiveEdit = useCallback(
+    (mutate: (src: StoredAnalysisResult) => StoredAnalysisResult) => {
+      const src = archiveAnalysisRef.current;
+      if (!src || forkingRef.current) return;
+      forkingRef.current = true;
+      const forked = withForkedRunBlock(mutate(src));
+      const sourceScreenshotsDir = archiveScreenshotsDirRef.current;
+      void (async () => {
+        try {
+          const dir = await workspace.getDirectoryHandle(name);
+          await forkRunToHead(dir, forked, sourceScreenshotsDir, name);
+          // Snap to the latest run + reload + re-scan the sidebar — the fork is now
+          // the live run, edited in place from here on (same as a revise landing).
+          onRunReplaced();
+        } catch {
+          // The fork write failed — release the guard so the user can retry. The
+          // source archive is untouched (best-effort, mirrors the edit-save stance).
+          forkingRef.current = false;
+        }
+      })();
+    },
+    [workspace, name, onRunReplaced],
+  );
+
   // Field edits: compute the next draft from the latest value (draftRef, not the
   // render-time closure), set it, and persist. Done in the event handler (not a
-  // setState updater) so it isn't double-invoked under StrictMode.
+  // setState updater) so it isn't double-invoked under StrictMode. On a PAST
+  // version each edit forks a new HEAD instead of persisting in place (TASK-68.4).
   const updateTask = useCallback(
     (index: number, patch: Partial<StoredVellumTask>) => {
+      if (viewingArchive) {
+        forkArchiveEdit((src) => ({
+          ...src,
+          tasks: src.tasks.map((t, i) => (i === index ? { ...t, ...patch } : t)),
+        }));
+        return;
+      }
       const cur = draftRef.current;
       if (!cur) return;
       const next: StoredAnalysisResult = {
@@ -1121,18 +1226,22 @@ function Body({
       setDraft(next);
       persist(next);
     },
-    [persist],
+    [persist, viewingArchive, forkArchiveEdit],
   );
 
   const updateOverview = useCallback(
     (overview: string) => {
+      if (viewingArchive) {
+        forkArchiveEdit((src) => ({ ...src, overview }));
+        return;
+      }
       const cur = draftRef.current;
       if (!cur) return;
       const next: StoredAnalysisResult = { ...cur, overview };
       setDraft(next);
       persist(next);
     },
-    [persist],
+    [persist, viewingArchive, forkArchiveEdit],
   );
 
   // ---- TASK-58 (ADR-024): structural edits — add / delete / reorder ---------
@@ -1149,25 +1258,36 @@ function Body({
   // optionals) — a human task with no frame renders without an image ("no preview")
   // and carries no AI baseline (so no revert-to-AI marker).
   const addTask = useCallback(() => {
-    const cur = draftRef.current;
-    if (!cur) return;
-    const newTask: StoredVellumTask = {
-      id: mintTaskId(cur.tasks),
+    const makeTask = (tasks: StoredVellumTask[]): StoredVellumTask => ({
+      id: mintTaskId(tasks),
       origin: "human",
       title: "New task",
       description: "Add a description.",
       category: "idea",
       priority: "med",
-    };
-    const next: StoredAnalysisResult = { ...cur, tasks: [...cur.tasks, newTask] };
+    });
+    if (viewingArchive) {
+      forkArchiveEdit((src) => ({ ...src, tasks: [...src.tasks, makeTask(src.tasks)] }));
+      return;
+    }
+    const cur = draftRef.current;
+    if (!cur) return;
+    const next: StoredAnalysisResult = { ...cur, tasks: [...cur.tasks, makeTask(cur.tasks)] };
     setDraft(next);
     persist(next);
-  }, [persist]);
+  }, [persist, viewingArchive, forkArchiveEdit]);
 
   // Delete a task by index (confirmed in the section). The orphaned screenshots/*.png
   // is left unreferenced on disk — harmless, not pruned (ADR-025).
   const deleteTask = useCallback(
     (index: number) => {
+      if (viewingArchive) {
+        forkArchiveEdit((src) => ({
+          ...src,
+          tasks: src.tasks.filter((_, i) => i !== index),
+        }));
+        return;
+      }
       const cur = draftRef.current;
       if (!cur) return;
       const next: StoredAnalysisResult = {
@@ -1177,7 +1297,7 @@ function Body({
       setDraft(next);
       persist(next);
     },
-    [persist],
+    [persist, viewingArchive, forkArchiveEdit],
   );
 
   // Reorder via up/down: swap a task with its neighbour (dependency-free — no dnd
@@ -1186,6 +1306,20 @@ function Body({
   // filename, so frames stay correct after the move (ADR-025).
   const moveTask = useCallback(
     (index: number, dir: -1 | 1) => {
+      if (viewingArchive) {
+        // Bounds-check against the source BEFORE forking, so an out-of-range move
+        // (top row up / bottom row down) never forks an identical copy.
+        const src = archiveAnalysisRef.current;
+        if (!src) return;
+        const target = index + dir;
+        if (target < 0 || target >= src.tasks.length) return;
+        forkArchiveEdit((s) => {
+          const tasks = [...s.tasks];
+          [tasks[index], tasks[target]] = [tasks[target], tasks[index]];
+          return { ...s, tasks };
+        });
+        return;
+      }
       const cur = draftRef.current;
       if (!cur) return;
       const target = index + dir;
@@ -1196,7 +1330,7 @@ function Body({
       setDraft(next);
       persist(next);
     },
-    [persist],
+    [persist, viewingArchive, forkArchiveEdit],
   );
 
   // ---- TASK-68.2 (ADR-024): commenting on the document ----------------------
@@ -1211,37 +1345,45 @@ function Body({
 
   useEffect(() => {
     let cancelled = false;
-    // Only the live editable run has comments; an archive resolves to none. State is
-    // set only inside the async callbacks (never synchronously in the effect body).
-    const load: Promise<Comment[]> = canEdit
-      ? workspace.getDirectoryHandle(name).then((dir) => readComments(dir))
+    // Comments follow the ACTIVE run (TASK-68.4): the live comments.json for the
+    // latest run, a past version's comments-<stamp>.json for an archive, or none
+    // for a read-only run. State is set only inside the async callbacks (never
+    // synchronously in the effect body).
+    const load: Promise<Comment[]> = activeCommentsFile
+      ? workspace
+          .getDirectoryHandle(name)
+          .then((dir) => readComments(dir, activeCommentsFile))
       : Promise.resolve([]);
     load
       .then((cs) => {
         if (!cancelled) setComments(cs);
       })
       .catch(() => {
-        // A missing/unreadable comments.json is a valid "no comments" state.
+        // A missing/unreadable sidecar is a valid "no comments" state.
         if (!cancelled) setComments([]);
       });
     return () => {
       cancelled = true;
     };
-  }, [canEdit, workspace, name, reloadKey]);
+  }, [activeCommentsFile, workspace, name, reloadKey]);
 
   // Serialize comment writes exactly like the edit save chain, so rapid add/edit/
   // delete can't race. Writes ONLY comments.json — never the analysis.
   const commentSaveChain = useRef<Promise<void>>(Promise.resolve());
   const persistComments = useCallback(
     (next: Comment[]) => {
+      // Persist to the ACTIVE run's sidecar (live comments.json or a past version's
+      // comments-<stamp>.json). Guarded: a read-only run has no target file.
+      const file = activeCommentsFile;
+      if (!file) return;
       commentSaveChain.current = commentSaveChain.current
         .catch(() => {})
         .then(async () => {
           const dir = await workspace.getDirectoryHandle(name);
-          await writeComments(dir, next);
+          await writeComments(dir, next, file);
         });
     },
-    [workspace, name],
+    [workspace, name, activeCommentsFile],
   );
 
   // Create a comment for a resolved target (field / overview range, whole task,
@@ -1297,12 +1439,21 @@ function Body({
 
   const beginReviseFlow = useCallback(
     (flavor: "text" | "video", config: AnalysisConfig) => {
-      // The current stored analysis (reflects saved edits); nothing to revise
-      // without it or without comments.
-      const source = draftRef.current;
+      // The run being revised: the past version when viewing an archive, else the
+      // live draft (which reflects saved edits). TASK-68.4 — revising a past version
+      // forks a new HEAD from IT, not from the latest. Nothing to revise without a
+      // source or without comments.
+      const source = viewingArchive ? archiveAnalysisRef.current : draftRef.current;
       const current = commentsRef.current;
       if (!source || current.length === 0) return;
       if (revise.status === "running") return;
+      // A text revise carries frames forward from the SOURCE run's folder — the
+      // past version's screenshots-<stamp>/ when viewing an archive, else the live
+      // screenshots/ (the writer's default). The video revise re-extracts fresh
+      // frames from the shared recording, so it needs no source frames.
+      const sourceScreenshotsDir = viewingArchive
+        ? archiveScreenshotsDirRef.current
+        : undefined;
 
       const controller = new AbortController();
       reviseAbort.current = controller;
@@ -1322,6 +1473,7 @@ function Body({
               model: config.model,
               language: config.language,
               signal: controller.signal,
+              sourceScreenshotsDir,
             });
           } else {
             // Re-run WITH video: a full analyze pipeline + the comments, so the full
@@ -1358,7 +1510,7 @@ function Body({
         }
       })();
     },
-    [revise.status, workspace, name, onRunReplaced],
+    [revise.status, workspace, name, onRunReplaced, viewingArchive],
   );
 
   const cancelRevise = useCallback(() => {
@@ -1374,25 +1526,30 @@ function Body({
     flavor: "text" | "video";
   } | null>(null);
 
-  // Seed the config dialog with the current run's choices so a revise defaults to
-  // how the session was last produced (model/mode/language), else the app defaults.
+  // The run a revise would act on: the past version when viewing an archive, else
+  // the live draft. Used to seed the config dialog + estimate the text cost so both
+  // reflect the ACTUAL source being revised (TASK-68.4).
+  const reviseSource = viewingArchive ? archivedData?.analysis ?? null : draft;
+
+  // Seed the config dialog with the source run's choices so a revise defaults to
+  // how that run was produced (model/mode/language), else the app defaults.
   const reviseDefaults = useMemo<Partial<AnalysisConfig>>(
     () => ({
-      model: draft?.run?.models?.[0],
-      mode: draft?.run?.mode,
-      language: draft?.run?.language,
+      model: reviseSource?.run?.models?.[0],
+      mode: reviseSource?.run?.mode,
+      language: reviseSource?.run?.language,
     }),
-    [draft],
+    [reviseSource],
   );
 
-  // Rough input-token budget for the TEXT-only revise cost estimate: the current
+  // Rough input-token budget for the TEXT-only revise cost estimate: the source
   // tasks + comments serialized (~4 chars/token). The video revise ignores this
   // (its cost is measured from the recording's duration instead).
   const reviseTextTokens = useMemo(() => {
-    if (!draft) return undefined;
-    const payload = JSON.stringify({ result: draft, comments });
+    if (!reviseSource) return undefined;
+    const payload = JSON.stringify({ result: reviseSource, comments });
     return Math.ceil(payload.length / 4);
-  }, [draft, comments]);
+  }, [reviseSource, comments]);
 
   if (showSkeleton || data === null) return <LoadingBody />;
 
@@ -1424,12 +1581,11 @@ function Body({
   }
 
   // TASK-51 — resolve which run's content the body renders. The latest (default)
-  // reads straight from `data`; an archived run reads from the on-demand load.
+  // reads straight from `data`; an archived run reads from the on-demand load
+  // (`viewingArchive` + `archivedData` are computed up top — they also gate editing).
   // While an archive loads we keep the latest's overview on the left (stable) and
   // show a loading state on the right rather than flashing the stale list.
-  const viewingArchive = selectedRun !== null;
   const runLoading = viewingArchive && archived.status !== "done";
-  const archivedData = archived.status === "done" ? archived.data : null;
 
   const activeAnalysis =
     viewingArchive && archivedData ? archivedData.analysis : data.analysis;
@@ -1456,12 +1612,14 @@ function Body({
     ? archiveStampFromSource(selectedRun?.source)
     : null;
 
-  // TASK-68.1 — inline editing is offered only on the LIVE run with a parsed
-  // analysis (`canEdit`). On that run we render from the editable `draft` (which
-  // reflects saved edits) instead of the on-disk read; an archived/read-only run
-  // renders its own content untouched.
-  const shownAnalysis = canEdit ? draft ?? activeAnalysis : activeAnalysis;
-  const shownOverview = canEdit ? draft?.overview ?? activeOverview : activeOverview;
+  // TASK-68.1/68.4 — the live run renders from the editable `draft` (reflecting
+  // saved edits) instead of the on-disk read. A past version renders its OWN
+  // analysis directly: editing it forks a new HEAD (there's no per-archive draft),
+  // so the on-screen content is the archive's until the fork lands.
+  const shownAnalysis = viewingArchive ? activeAnalysis : draft ?? activeAnalysis;
+  const shownOverview = viewingArchive
+    ? activeOverview
+    : draft?.overview ?? activeOverview;
 
   return (
     <>

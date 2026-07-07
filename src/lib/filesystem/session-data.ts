@@ -227,6 +227,19 @@ export interface ArchivedRunData {
   malformed: boolean;
   reportFile: string | null;
   screenshotsDir: string;
+  /**
+   * TASK-68.4 — the run's unified ADR-023 stamp (e.g. "2026-07-02-131500"), or null
+   * for a legacy/unstamped archive. A non-null stamp is what makes a past version
+   * EDITABLE + COMMENTABLE (forking from it needs to locate its frames and its
+   * comments sidecar by stamp); an unstamped archive stays read-only.
+   */
+  stamp: string | null;
+  /**
+   * TASK-68.4 — this run's comments sidecar (comments-<stamp>.json), or null when
+   * the run has no resolvable stamp. Commenting on a past version reads/writes THIS
+   * file (never the live comments.json), so the annotation stays with its version.
+   */
+  commentsFile: string | null;
 }
 
 /**
@@ -278,8 +291,12 @@ export async function loadArchivedRun(
   // The frames folder for this run; may be absent (legacy pre-Option-B run) — the
   // reader that consumes it handles a missing folder as "no preview" (ADR-013).
   const screenshotsDir = stamp ? screenshotsArchiveName(stamp) : SCREENSHOTS_DIR;
+  // TASK-68.4 — this run's own comments sidecar, paired by the same unified stamp
+  // (write-report-browser archives it as comments-<stamp>.json). Null for an
+  // unstamped legacy archive → the view keeps that run read-only.
+  const commentsFile = stamp ? `comments-${stamp}.json` : null;
 
-  return { analysis, malformed, reportFile, screenshotsDir };
+  return { analysis, malformed, reportFile, screenshotsDir, stamp, commentsFile };
 }
 
 /**

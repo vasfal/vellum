@@ -20,11 +20,15 @@ const COMMENTS_NAME = "comments.json";
 /**
  * Read a session's comments. Missing file → []. Unreadable / not JSON / wrong
  * shape → [] (best-effort; a corrupt sidecar must not take down the view).
+ *
+ * `fileName` defaults to the live comments.json; TASK-68.4 passes a past version's
+ * archived sidecar (comments-<stamp>.json) so a reviewer can comment on any run.
  */
 export async function readComments(
   sessionDir: FileSystemDirectoryHandle,
+  fileName: string = COMMENTS_NAME,
 ): Promise<Comment[]> {
-  const handle = await getFileHandleOrNull(sessionDir, COMMENTS_NAME);
+  const handle = await getFileHandleOrNull(sessionDir, fileName);
   if (!handle) return [];
   let text: string;
   try {
@@ -43,21 +47,26 @@ export async function readComments(
 }
 
 /**
- * Write a session's comments (pretty-printed). Overwrites comments.json in place —
- * comments are per-current-version, never archived here (TASK-60). Fails loud on a
- * genuine write error so the caller's save chain can retry, but the shape is
- * validated first so a malformed array never reaches disk.
+ * Write a session's comments (pretty-printed). Overwrites the sidecar in place —
+ * comments are per-version, never archived here (TASK-60). Fails loud on a genuine
+ * write error so the caller's save chain can retry, but the shape is validated
+ * first so a malformed array never reaches disk.
+ *
+ * `fileName` defaults to the live comments.json; TASK-68.4 passes a past version's
+ * archived sidecar (comments-<stamp>.json) when commenting on that run. The tasks/
+ * report archive of the version stays untouched — only its annotation layer changes.
  */
 export async function writeComments(
   sessionDir: FileSystemDirectoryHandle,
   comments: Comment[],
+  fileName: string = COMMENTS_NAME,
 ): Promise<void> {
   // Validate against the STRICT write schema (the read schema also accepts the
   // legacy shape; a write must only ever persist the current `target` shape).
   const validated = CommentsWriteSchema.parse({ comments });
   await writeTextFile(
     sessionDir,
-    COMMENTS_NAME,
+    fileName,
     JSON.stringify(validated, null, 2) + "\n",
   );
 }
