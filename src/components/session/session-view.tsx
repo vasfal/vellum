@@ -1642,7 +1642,12 @@ function RightColumn({
         <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-4 pt-3 pb-3">
           <div className="flex min-w-0 items-center gap-2">
             {analysis !== null && (
-              <span className="text-[13px] font-medium text-foreground">Tasks</span>
+              <span className="flex items-baseline gap-1.5">
+                <span className="text-[13px] font-medium text-foreground">Tasks</span>
+                <span className="font-mono text-[12px] tabular-nums text-muted-foreground">
+                  {analysis.tasks.length}
+                </span>
+              </span>
             )}
           </div>
           <div className="flex items-center gap-1.5">
