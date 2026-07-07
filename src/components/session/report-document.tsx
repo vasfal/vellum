@@ -321,8 +321,10 @@ function TaskSection({
         </span>
       </div>
 
-      {/* Meta row: type + priority pills, then the discussed/visible timecodes. */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pl-7">
+      {/* Meta row: type + priority pills, then the discussed/visible timecodes.
+          All content rows share the section's left edge — same as the number —
+          so the number, screenshot and text align down a single left margin. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
         <span className="flex shrink-0 items-center gap-1.5">
           {editing ? (
             <>
@@ -365,7 +367,7 @@ function TaskSection({
       </div>
 
       {/* The extracted frame, inline. Clicking it seeks to where it's visible. */}
-      <div className="pl-7">
+      <div>
         <TaskScreenshot
           url={screenshotUrl}
           alt={task.title}
@@ -375,7 +377,7 @@ function TaskSection({
       </div>
 
       {/* Description — markdown-aware inline edit (raw on click, rendered on blur). */}
-      <div className="flex items-start gap-1 pl-7">
+      <div className="flex items-start gap-1">
         <span className="min-w-0 flex-1">
           {editing ? (
             <InlineMarkdown
@@ -393,7 +395,7 @@ function TaskSection({
       {/* Screen context — a quieter note; plain inline text (not markdown). A
           human-added task may carry none (undefined) → the row is skipped. */}
       {task.screen_context !== undefined && (
-          <div className="flex items-start gap-1 pl-7 text-xs leading-relaxed text-muted-foreground/80">
+          <div className="flex items-start gap-1 text-xs leading-relaxed text-muted-foreground/80">
             <span className="shrink-0 py-0.5 text-muted-foreground/60">
               Screen —
             </span>
@@ -418,7 +420,7 @@ function TaskSection({
           reserved so revealing it never shifts the section. Delete is always
           available while editing, so the rail always renders here. */}
       {editing && (
-        <div className="ml-7 flex items-center justify-between opacity-0 transition-opacity duration-150 ease-out group-hover:opacity-100 focus-within:opacity-100">
+        <div className="flex items-center justify-between opacity-0 transition-opacity duration-150 ease-out group-hover:opacity-100 focus-within:opacity-100">
           <div className="flex items-center gap-0.5">
             <ControlIcon
               label="Move up"
@@ -463,7 +465,7 @@ function Timecodes({
 }) {
   if (!timestamp && !screenshotTimestamp) return null;
   return (
-    <div className="flex items-center gap-2 font-mono text-[11px] tabular-nums text-muted-foreground">
+    <div className="flex items-center gap-1.5">
       {timestamp && (
         <TimecodeButton
           label="discussed"
@@ -471,11 +473,6 @@ function Timecodes({
           tooltip="Jump to where this was discussed"
           onClick={() => onSeek(timestamp)}
         />
-      )}
-      {timestamp && screenshotTimestamp && (
-        <span aria-hidden className="text-border">
-          ·
-        </span>
       )}
       {screenshotTimestamp && (
         <TimecodeButton
@@ -489,6 +486,9 @@ function Timecodes({
   );
 }
 
+// A timecode reads as a badge (matching the type/priority pills) rather than
+// loose mono text, but stays a seek button: a small uppercase label + the mono
+// mm:ss, in a bordered chip that warms on hover.
 function TimecodeButton({
   label,
   value,
@@ -507,11 +507,12 @@ function TimecodeButton({
           <button
             type="button"
             onClick={onClick}
-            className="rounded transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            className="inline-flex items-center gap-1.5 rounded-full border border-border px-2 py-px text-[10px] text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
         }
       >
-        {label} {value}
+        <span className="font-medium uppercase tracking-wide">{label}</span>
+        <span className="font-mono tabular-nums">{value}</span>
       </TooltipTrigger>
       <TooltipContent>{tooltip}</TooltipContent>
     </Tooltip>

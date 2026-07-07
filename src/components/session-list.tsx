@@ -261,10 +261,28 @@ function SessionMenuItem({ session }: { session: SessionRow }) {
           at rest; revealed on row hover / keyboard focus-within (showOnHover) and
           held open while the menu is (aria-expanded). Base UI Menu portals the
           popup, so it sits above the row without affecting layout. */}
-      <Menu.Root>
+      <Menu.Root
+        // After the menu closes the trigger keeps DOM focus, and the sidebar's
+        // `group-focus-within` reveal would keep the kebab showing even once the
+        // pointer leaves the row. Blur the trigger on close so it hides again —
+        // but only if the trigger itself still holds focus. When a menu item
+        // opened the rename/delete dialog, focus is already in the dialog, so
+        // activeElement isn't the kebab and we leave it untouched.
+        onOpenChange={(open) => {
+          if (open) return;
+          requestAnimationFrame(() => {
+            const el = document.activeElement as HTMLElement | null;
+            if (el?.getAttribute("data-sidebar") === "menu-action") el.blur();
+          });
+        }}
+      >
         <Menu.Trigger
           render={
-            <SidebarMenuAction showOnHover aria-label="Session actions" />
+            <SidebarMenuAction
+              showOnHover
+              aria-label="Session actions"
+              className="[&>svg]:size-3.5"
+            />
           }
         >
           <MoreHorizontal strokeWidth={1.5} />
