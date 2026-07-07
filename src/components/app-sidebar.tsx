@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { Search, X } from "lucide-react";
 
 import { ImportVideo } from "@/components/import-video";
@@ -68,7 +69,18 @@ export function AppSidebar() {
           {/* Version baseline-aligns to the foot of the wordmark (items-end +
               leading-none), the cluster stays vertically centred in the band. */}
           <div className="flex items-end gap-2">
-            <Logo className="h-[18px]" />
+            {/* TASK-70 — the wordmark links home (the start page). Kept to the
+                logo itself (not the version) so the click target reads as the
+                brand. rounded-sm + focus ring make it keyboard-reachable; the
+                anchor's default pointer cursor signals it's clickable without
+                any colour change (stays monochrome). */}
+            <Link
+              href="/"
+              aria-label="Vellum home"
+              className="rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Logo className="h-[18px]" />
+            </Link>
             <span className="relative -top-px font-mono text-[11px] leading-none tabular-nums text-muted-foreground">
               {APP_VERSION}
             </span>
