@@ -1,6 +1,6 @@
 {
   "name": "@vasfal/vellum",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
@@ -28,9 +28,9 @@
   },
   "scripts": {
     "dev": "next dev -p 4270",
-    "build": "next build",
+    "build": "next build --webpack",
     "start": "next start",
-    "prepack": "rm -rf .next && next build",
+    "prepack": "rm -rf .next && next build --webpack && rm -rf .next/cache .next/trace .next/trace-build",
     "lint": "eslint",
     "upload": "tsx --env-file-if-exists=.env.local scripts/upload-video.ts",
     "analyze": "tsx --env-file-if-exists=.env.local scripts/analyze-video.ts",
