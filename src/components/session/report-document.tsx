@@ -325,7 +325,10 @@ function TaskSection({
           All content rows share the section's left edge — same as the number —
           so the number, screenshot and text align down a single left margin. */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-        <span className="flex shrink-0 items-center gap-1.5">
+        {/* text-[10px] leading-none so the EnumSelect trigger buttons wrapping the
+            pills don't inherit the document's 16px/24px line box — that tall line
+            box baseline-shifted the pills ~2px below the bare timecode badges. */}
+        <span className="flex shrink-0 items-center gap-1.5 text-[10px] leading-none">
           {editing ? (
             <>
               <EnumSelect
