@@ -19,7 +19,11 @@
 // Client-safe: no Node built-in imports (no Buffer, no fs, no path).
 
 import { AnalysisResultSchema, type AnalysisResult } from "@/lib/gemini/schema";
-import { upgrade } from "@/lib/gemini/stored";
+import {
+  StoredAnalysisResultSchema,
+  upgrade,
+  type StoredAnalysisResult,
+} from "@/lib/gemini/stored";
 import {
   archiveStamp,
   renderMarkdown,
@@ -177,11 +181,16 @@ export async function writeRevisedRunBrowser(
   sessionDir: FileSystemDirectoryHandle,
   result: AnalysisResult,
   sessionName: string,
+  // TASK-68.4 — the frames to carry forward come from THIS folder. Defaults to the
+  // live screenshots/ (revising the latest run). When revising a PAST version the
+  // caller passes that run's screenshots-<stamp>/ so the fork carries the source
+  // version's frames, not the current HEAD's — the source archive is only read.
+  sourceScreenshotsDir: string = SCREENSHOTS_DIR,
 ): Promise<WriteReportBrowserOutput> {
   const validated = AnalysisResultSchema.parse(result);
 
-  // 1. Snapshot the existing frames (name -> bytes) before anything is archived.
-  const existing = await readScreenshots(sessionDir);
+  // 1. Snapshot the source frames (name -> bytes) before anything is archived.
+  const existing = await readScreenshots(sessionDir, sourceScreenshotsDir);
 
   // 2. Resolve each revised task's frame by the SAME timestamp→name algorithm used
   //    at initial write (deriveScreenshotNames). A derived name that exists in the
@@ -232,12 +241,92 @@ export async function writeRevisedRunBrowser(
   };
 }
 
-/** Read every PNG in screenshots/ into memory (name -> bytes). Missing folder → empty. */
+/**
+ * TASK-68.4 (parent TASK-68 decision #2 "linear, revise-from-any") — fork a PAST
+ * run version to a NEW HEAD after a manual edit of it.
+ *
+ * The user opened an archived version, edited a field (or added / removed / moved a
+ * task). Rather than mutate the immutable archive, we PROMOTE the edited version to
+ * the new latest run: archive the CURRENT HEAD under a fresh unified stamp (exactly
+ * like an AI run does — archivePriorRun), then write the edited version as the live
+ * report.md / tasks.json and re-materialize screenshots/ from the SOURCE version's
+ * frames. History stays a linear newest→oldest list: the source archive is untouched
+ * and still sits in it; the fork is simply the newest run.
+ *
+ * `result` is the source version's tasks WITH the triggering edit applied and a
+ * FRESH run block (new analyzedAt so it sorts newest; zero-cost telemetry so a free
+ * manual fork can't inflate the session cost total) — the caller stamps both.
+ * `sourceScreenshotsDir` is the source version's frames folder (screenshots-<stamp>/),
+ * read-only here. The new HEAD starts comment-free and with no AI baseline (it is
+ * re-snapshotted lazily on the next first edit), matching a normal new run.
+ */
+export async function forkRunToHead(
+  sessionDir: FileSystemDirectoryHandle,
+  result: StoredAnalysisResult,
+  sourceScreenshotsDir: string,
+  sessionName: string,
+): Promise<WriteReportBrowserOutput> {
+  // Fail loud on a malformed fork — the UI / re-render round-trips through this
+  // schema, same gate as the other writers.
+  const validated = StoredAnalysisResultSchema.parse(result);
+
+  // 1. Read the SOURCE version's frames before anything is archived. This is a
+  //    COPY source only — the source's screenshots-<stamp>/ is never removed, so
+  //    the immutable archive of the source version stays intact.
+  const sourceFrames = await readScreenshots(sessionDir, sourceScreenshotsDir);
+
+  // 2. Archive the CURRENT HEAD (report/tasks/screenshots/comments/baseline) under
+  //    one fresh unified stamp — the exact ADR-009/023 machinery an AI run uses. A
+  //    manual fork never swaps the recording, so it isn't snapshotted.
+  await archivePriorRun(sessionDir, false);
+
+  // 3. Write the forked version as the new HEAD (report.md + tasks.json), byte-
+  //    consistent with every other writer (shared renderMarkdown + JSON layout).
+  const override = await readOverrideName(sessionDir);
+  const markdown = renderMarkdown({
+    title: sessionDisplayName({
+      override,
+      suggested: validated.suggested_name,
+      folderName: sessionName,
+    }),
+    date: today(),
+    relVideo: "recording.webm",
+    result: validated,
+  });
+  await writeTextFile(sessionDir, REPORT_NAME, markdown);
+  await writeTextFile(sessionDir, TASKS_NAME, JSON.stringify(validated, null, 2) + "\n");
+
+  // 4. Recreate screenshots/ carrying forward each task's PINNED frame (ADR-025 —
+  //    the stored task.screenshot name) from the source version. A task whose frame
+  //    isn't in the source set degrades to "no preview" rather than crashing.
+  const shotsDir = await sessionDir.getDirectoryHandle(SCREENSHOTS_DIR, { create: true });
+  const written: string[] = [];
+  for (const task of validated.tasks) {
+    const name = task.screenshot;
+    if (!name) continue;
+    if (written.includes(name)) continue; // a name is written at most once
+    const bytes = sourceFrames.get(name);
+    if (!bytes) continue;
+    await writeBytesFile(shotsDir, name, bytes);
+    written.push(name);
+  }
+
+  return {
+    reportName: REPORT_NAME,
+    tasksJsonName: TASKS_NAME,
+    screenshotNames: written,
+  };
+}
+
+/** Read every PNG in a frames folder into memory (name -> bytes). Missing folder →
+ *  empty. `dirName` defaults to the live screenshots/, but a past version's archived
+ *  screenshots-<stamp>/ can be read the same way (TASK-68.4). */
 async function readScreenshots(
   dir: FileSystemDirectoryHandle,
+  dirName: string = SCREENSHOTS_DIR,
 ): Promise<Map<string, Uint8Array<ArrayBuffer>>> {
   const out = new Map<string, Uint8Array<ArrayBuffer>>();
-  const shotsDir = await getDirectoryHandleOrNull(dir, SCREENSHOTS_DIR);
+  const shotsDir = await getDirectoryHandleOrNull(dir, dirName);
   if (!shotsDir) return out;
   for await (const entry of shotsDir.values()) {
     if (entry.kind !== "file") continue;

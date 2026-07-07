@@ -32,6 +32,13 @@ export interface RunReviseArgs {
   model?: string;
   /** Aborts the in-flight POST (cancel). */
   signal?: AbortSignal;
+  /**
+   * TASK-68.4 — the frames folder the forked run carries forward. Omitted → the
+   * live screenshots/ (revising the latest run). When "Process comments" is run on
+   * a PAST version, the caller passes that version's screenshots-<stamp>/ so the
+   * fork carries the source version's frames; the source archive is only read.
+   */
+  sourceScreenshotsDir?: string;
 }
 
 /** The /api/revise response: a revised result, or a structured pipeline error. */
@@ -48,6 +55,7 @@ export async function runRevise({
   language,
   model,
   signal,
+  sourceScreenshotsDir,
 }: RunReviseArgs): Promise<WriteReportBrowserOutput> {
   let res: Response;
   try {
@@ -91,6 +99,11 @@ export async function runRevise({
   }
 
   // Write the revised result as a new run (archives the prior run + comments,
-  // carries existing frames forward — TASK-60).
-  return writeRevisedRunBrowser(sessionDir, body.result, sessionName);
+  // carries the source version's frames forward — TASK-60 / TASK-68.4).
+  return writeRevisedRunBrowser(
+    sessionDir,
+    body.result,
+    sessionName,
+    sourceScreenshotsDir,
+  );
 }
