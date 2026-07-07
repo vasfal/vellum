@@ -11,6 +11,7 @@
 
 import {
   CommentsFileSchema,
+  CommentsWriteSchema,
   type Comment,
 } from "@/lib/comments/comment";
 
@@ -51,7 +52,9 @@ export async function writeComments(
   sessionDir: FileSystemDirectoryHandle,
   comments: Comment[],
 ): Promise<void> {
-  const validated = CommentsFileSchema.parse({ comments });
+  // Validate against the STRICT write schema (the read schema also accepts the
+  // legacy shape; a write must only ever persist the current `target` shape).
+  const validated = CommentsWriteSchema.parse({ comments });
   await writeTextFile(
     sessionDir,
     COMMENTS_NAME,

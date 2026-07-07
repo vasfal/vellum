@@ -36,6 +36,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useAnalysis } from "@/components/analysis/analysis-provider";
+import {
+  AnalysisConfigDialog,
+  type AnalysisConfig,
+} from "@/components/analysis/analysis-config-dialog";
 import { useWorkspace } from "@/components/workspace/workspace-provider";
 import { useObjectUrl } from "@/hooks/useObjectUrl";
 import {
@@ -53,7 +57,15 @@ import {
   readAiBaseline,
   saveSessionEdits,
 } from "@/lib/filesystem/write-edits-browser";
+import { readComments, writeComments } from "@/lib/filesystem/comments-browser";
 import { downloadTextFile } from "@/lib/filesystem/download";
+import {
+  mintCommentId,
+  type Comment,
+  type CommentTarget,
+} from "@/lib/comments/comment";
+import { AnalyzeFlowError, runAnalyze } from "@/lib/analyze/run-analyze";
+import { runRevise } from "@/lib/analyze/run-revise";
 import {
   kebabCase,
   mmssToSec,
@@ -71,6 +83,7 @@ import { FadeText } from "@/components/fade-text";
 import { PageHeader } from "@/components/page-header";
 import { AnalyzeStatus, type AnalyzeState } from "./analyze-action";
 import { ReportDocument } from "./report-document";
+import type { ReviseUiState } from "./comment-mode";
 
 // TASK-17 — the session view. Loads one session's tasks.json + recording.webm
 // through the live workspace handle (TASK-15) and lays out a sticky video player
@@ -341,6 +354,14 @@ export function SessionView({ name }: { name: string }) {
         reloadKey={`${reloadNonce}:${completedCount}`}
         selectedRun={selectedRun}
         onSelectRun={setSelectedRun}
+        otherAnalysisActive={analysis !== null}
+        onRunReplaced={() => {
+          // TASK-68.2 — a revise wrote a new run: snap to the latest, reload in
+          // place, and re-scan the sidebar, exactly like an analysis completion.
+          setSelectedRun(null);
+          setReloadNonce((n) => n + 1);
+          refreshSessions();
+        }}
       />
 
       {/* Cancel-analysis confirmation (TASK-42). Nothing is written until the run
@@ -885,6 +906,8 @@ function Body({
   reloadKey,
   selectedRun,
   onSelectRun,
+  otherAnalysisActive,
+  onRunReplaced,
 }: {
   data: SessionData | null;
   /** The kept-previous-data skeleton gate: true only on first load or a slow
@@ -904,6 +927,11 @@ function Body({
   // Info tab can switch runs and the body can render the selected one.
   selectedRun: SelectedRun | null;
   onSelectRun: (run: SelectedRun | null) => void;
+  // TASK-68.2 — an analysis run (in the app-level controller) is active anywhere;
+  // block starting a revise while one is (one AI action at a time).
+  otherAnalysisActive: boolean;
+  // TASK-68.2 — a revise wrote a new run; ask the parent to reload view + sidebar.
+  onRunReplaced: () => void;
 }) {
   // The player lives in the left column; a timecode / screenshot click in the
   // document (right column) seeks it. A shared ref is the seam between the two
@@ -1135,11 +1163,200 @@ function Body({
     [persist],
   );
 
-  // SEAM (sibling task — TASK-68.x): commenting was removed with the mode switcher
-  // and will return as select-to-comment directly on the document (each task
-  // section already carries `data-task-id`). Its persistence (comments-browser.ts)
-  // and the comment→AI-revise loop (run-revise.ts) remain in the codebase, unwired,
-  // for that task to reconnect — along with the parent's reload-after-revise plumbing.
+  // ---- TASK-68.2 (ADR-024): commenting on the document ----------------------
+  // Comments are a SEPARATE sidecar (comments.json) — commenting never touches
+  // tasks.json / report.md (all writes below go through writeComments only). Loaded
+  // once per session on the live run; re-read on reload (rename / re-analysis).
+  const [comments, setComments] = useState<Comment[]>([]);
+  const commentsRef = useRef(comments);
+  useEffect(() => {
+    commentsRef.current = comments;
+  }, [comments]);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Only the live editable run has comments; an archive resolves to none. State is
+    // set only inside the async callbacks (never synchronously in the effect body).
+    const load: Promise<Comment[]> = canEdit
+      ? workspace.getDirectoryHandle(name).then((dir) => readComments(dir))
+      : Promise.resolve([]);
+    load
+      .then((cs) => {
+        if (!cancelled) setComments(cs);
+      })
+      .catch(() => {
+        // A missing/unreadable comments.json is a valid "no comments" state.
+        if (!cancelled) setComments([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [canEdit, workspace, name, reloadKey]);
+
+  // Serialize comment writes exactly like the edit save chain, so rapid add/edit/
+  // delete can't race. Writes ONLY comments.json — never the analysis.
+  const commentSaveChain = useRef<Promise<void>>(Promise.resolve());
+  const persistComments = useCallback(
+    (next: Comment[]) => {
+      commentSaveChain.current = commentSaveChain.current
+        .catch(() => {})
+        .then(async () => {
+          const dir = await workspace.getDirectoryHandle(name);
+          await writeComments(dir, next);
+        });
+    },
+    [workspace, name],
+  );
+
+  // Create a comment for a resolved target (field / overview range, whole task,
+  // task group, or session). Mints a collision-free id + timestamp, then persists.
+  const addComment = useCallback(
+    (target: CommentTarget, body: string) => {
+      const cur = commentsRef.current;
+      const comment: Comment = {
+        id: mintCommentId(cur),
+        target,
+        body,
+        createdAt: new Date().toISOString(),
+      };
+      const next = [...cur, comment];
+      setComments(next);
+      persistComments(next);
+    },
+    [persistComments],
+  );
+
+  const editComment = useCallback(
+    (id: string, body: string) => {
+      const next = commentsRef.current.map((c) =>
+        c.id === id ? { ...c, body } : c,
+      );
+      setComments(next);
+      persistComments(next);
+    },
+    [persistComments],
+  );
+
+  const deleteComment = useCallback(
+    (id: string) => {
+      const next = commentsRef.current.filter((c) => c.id !== id);
+      setComments(next);
+      persistComments(next);
+    },
+    [persistComments],
+  );
+
+  // ---- TASK-68.2 (ADR-024): the comment→AI-revise loop ----------------------
+  // Two flavors, both from the document footer when comments exist: a text-only
+  // revise (fast/cheap, no video — /api/revise) and a re-run-with-video (the full
+  // grounded pipeline + the comments, /api/analyze). Both write a NEW run (archiving
+  // the prior run + its comments), so on success we clear the local comments and ask
+  // the parent to reload. Cancellable via an AbortController.
+  const [revise, setRevise] = useState<ReviseUiState>({ status: "idle" });
+  const reviseAbort = useRef<AbortController | null>(null);
+  useEffect(
+    () => () => reviseAbort.current?.abort(), // abort a run in flight on unmount
+    [],
+  );
+
+  const beginReviseFlow = useCallback(
+    (flavor: "text" | "video", config: AnalysisConfig) => {
+      // The current stored analysis (reflects saved edits); nothing to revise
+      // without it or without comments.
+      const source = draftRef.current;
+      const current = commentsRef.current;
+      if (!source || current.length === 0) return;
+      if (revise.status === "running") return;
+
+      const controller = new AbortController();
+      reviseAbort.current = controller;
+      setRevise({ status: "running", flavor });
+
+      void (async () => {
+        try {
+          const dir = await workspace.getDirectoryHandle(name);
+          if (flavor === "text") {
+            // Text-only revise: the chosen model + language thread into /api/revise
+            // (mode is n/a for a single text call, so the dialog never asked).
+            await runRevise({
+              sessionDir: dir,
+              sessionName: name,
+              result: source,
+              comments: current,
+              model: config.model,
+              language: config.language,
+              signal: controller.signal,
+            });
+          } else {
+            // Re-run WITH video: a full analyze pipeline + the comments, so the full
+            // config (model + mode + language) threads into /api/analyze.
+            await runAnalyze({
+              sessionDir: dir,
+              sessionName: name,
+              model: config.model,
+              mode: config.mode,
+              language: config.language,
+              signal: controller.signal,
+              revise: { result: source, comments: current },
+              onProgress: () => {
+                // A coarse busy state is enough — the footer shows "Re-running…".
+              },
+            });
+          }
+          if (controller.signal.aborted) return;
+          setRevise({ status: "idle" });
+          setComments([]); // the new run starts comment-free (archived with the old)
+          onRunReplaced();
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError") {
+            setRevise({ status: "idle" });
+            return;
+          }
+          const message =
+            err instanceof AnalyzeFlowError
+              ? err.message
+              : err instanceof Error
+                ? err.message
+                : String(err);
+          setRevise({ status: "error", message });
+        }
+      })();
+    },
+    [revise.status, workspace, name, onRunReplaced],
+  );
+
+  const cancelRevise = useCallback(() => {
+    reviseAbort.current?.abort();
+    setRevise({ status: "idle" });
+  }, []);
+
+  // Both revise actions go through the SAME pre-analysis config gate as a fresh
+  // analysis (always ask model/language before spending on a call). The footer
+  // buttons open this dialog; confirming runs beginReviseFlow with the chosen
+  // config. null = closed.
+  const [reviseConfig, setReviseConfig] = useState<{
+    flavor: "text" | "video";
+  } | null>(null);
+
+  // Seed the config dialog with the current run's choices so a revise defaults to
+  // how the session was last produced (model/mode/language), else the app defaults.
+  const reviseDefaults = useMemo<Partial<AnalysisConfig>>(
+    () => ({
+      model: draft?.run?.models?.[0],
+      mode: draft?.run?.mode,
+      language: draft?.run?.language,
+    }),
+    [draft],
+  );
+
+  // Rough input-token budget for the TEXT-only revise cost estimate: the current
+  // tasks + comments serialized (~4 chars/token). The video revise ignores this
+  // (its cost is measured from the recording's duration instead).
+  const reviseTextTokens = useMemo(() => {
+    if (!draft) return undefined;
+    const payload = JSON.stringify({ result: draft, comments });
+    return Math.ceil(payload.length / 4);
+  }, [draft, comments]);
 
   if (showSkeleton || data === null) return <LoadingBody />;
 
@@ -1211,48 +1428,80 @@ function Body({
   const shownOverview = canEdit ? draft?.overview ?? activeOverview : activeOverview;
 
   return (
-    <main
-      ref={mainRef}
-      className="grid min-h-0 flex-1"
-      style={{ gridTemplateColumns: `minmax(0,1fr) 1px ${rightWidth}px` }}
-    >
-      <PlayerPane
-        recording={data.recording}
-        showTabs={data.analysis !== null}
-        videoRef={videoRef}
-        workspace={workspace}
-        name={name}
-        reloadKey={reloadKey}
-        selectedSource={selectedRun?.source ?? null}
-        onSelectRun={onSelectRun}
-        liveEdited={liveEdited}
+    <>
+      <main
+        ref={mainRef}
+        className="grid min-h-0 flex-1"
+        style={{ gridTemplateColumns: `minmax(0,1fr) 1px ${rightWidth}px` }}
+      >
+        <PlayerPane
+          recording={data.recording}
+          showTabs={data.analysis !== null}
+          videoRef={videoRef}
+          workspace={workspace}
+          name={name}
+          reloadKey={reloadKey}
+          selectedSource={selectedRun?.source ?? null}
+          onSelectRun={onSelectRun}
+          liveEdited={liveEdited}
+        />
+        <ResizeHandle onPointerDown={startResize} />
+        <RightColumn
+          analysis={shownAnalysis}
+          malformed={activeMalformed}
+          reportFile={activeReportFile}
+          screenshotsDir={activeScreenshotsDir}
+          loading={runLoading}
+          viewingArchive={viewingArchive}
+          onGoToLatest={() => onSelectRun(null)}
+          displayName={data.displayName}
+          downloadStamp={activeDownloadStamp}
+          editing={editing}
+          baselineById={baselineById}
+          onTaskChange={updateTask}
+          onAddTask={addTask}
+          onDeleteTask={deleteTask}
+          onMoveTask={moveTask}
+          reloadToken={savedNonce}
+          workspace={workspace}
+          name={name}
+          onSeek={seekTo}
+          overview={shownOverview}
+          onOverviewChange={updateOverview}
+          overviewBaseline={baseline?.overview}
+          // TASK-68.2 — commenting on the live document. `commenting` follows the
+          // same gate as editing (the live parsed run); archives stay read-only.
+          commenting={editing}
+          comments={comments}
+          reviseState={revise}
+          reviseBlocked={otherAnalysisActive}
+          onAddComment={addComment}
+          onEditComment={editComment}
+          onDeleteComment={deleteComment}
+          onProcessComments={() => setReviseConfig({ flavor: "text" })}
+          onReRunWithVideo={() => setReviseConfig({ flavor: "video" })}
+          onCancelRevise={cancelRevise}
+        />
+      </main>
+
+      {/* TASK-68.2 — the pre-analysis config gate for BOTH revise actions, reusing
+          the same dialog as a fresh analysis. "Process comments" opens the text-only
+          variant (model + language, cheap text cost); "Re-run with video" opens the
+          full config (model + mode + language, full-video cost). Confirming threads
+          the choice into beginReviseFlow. */}
+      <AnalysisConfigDialog
+        variant={reviseConfig?.flavor === "video" ? "revise-video" : "revise-text"}
+        sessionName={reviseConfig ? name : null}
+        defaults={reviseDefaults}
+        textInputTokens={reviseTextTokens}
+        onStart={(config) => {
+          const flavor = reviseConfig?.flavor;
+          setReviseConfig(null);
+          if (flavor) beginReviseFlow(flavor, config);
+        }}
+        onClose={() => setReviseConfig(null)}
       />
-      <ResizeHandle onPointerDown={startResize} />
-      <RightColumn
-        analysis={shownAnalysis}
-        malformed={activeMalformed}
-        reportFile={activeReportFile}
-        screenshotsDir={activeScreenshotsDir}
-        loading={runLoading}
-        viewingArchive={viewingArchive}
-        onGoToLatest={() => onSelectRun(null)}
-        displayName={data.displayName}
-        downloadStamp={activeDownloadStamp}
-        editing={editing}
-        baselineById={baselineById}
-        onTaskChange={updateTask}
-        onAddTask={addTask}
-        onDeleteTask={deleteTask}
-        onMoveTask={moveTask}
-        reloadToken={savedNonce}
-        workspace={workspace}
-        name={name}
-        onSeek={seekTo}
-        overview={shownOverview}
-        onOverviewChange={updateOverview}
-        overviewBaseline={baseline?.overview}
-      />
-    </main>
+    </>
   );
 }
 
@@ -1284,6 +1533,16 @@ function RightColumn({
   overview,
   onOverviewChange,
   overviewBaseline,
+  commenting,
+  comments,
+  reviseState,
+  reviseBlocked,
+  onAddComment,
+  onEditComment,
+  onDeleteComment,
+  onProcessComments,
+  onReRunWithVideo,
+  onCancelRevise,
 }: {
   /** The ACTIVE run's content (TASK-51): the latest draft, or a selected archive. */
   analysis: StoredAnalysisResult | null;
@@ -1318,6 +1577,19 @@ function RightColumn({
   overview: string;
   onOverviewChange: (next: string) => void;
   overviewBaseline: string | undefined;
+  // TASK-68.2 — commenting on the document + the comment→AI-revise controls. All
+  // are forwarded straight to ReportDocument (below); commenting is gated to the
+  // live editable run (archives stay read-only).
+  commenting: boolean;
+  comments: Comment[];
+  reviseState: ReviseUiState;
+  reviseBlocked: boolean;
+  onAddComment: (target: CommentTarget, body: string) => void;
+  onEditComment: (id: string, body: string) => void;
+  onDeleteComment: (id: string) => void;
+  onProcessComments: () => void;
+  onReRunWithVideo: () => void;
+  onCancelRevise: () => void;
 }) {
   // The header row shows whenever there's something to put in it: a run to export
   // (report.md or a parsed analysis → the download kebab) or an archived run to
@@ -1369,6 +1641,16 @@ function RightColumn({
           name={name}
           screenshotsDir={screenshotsDir}
           reloadToken={reloadToken}
+          commenting={commenting}
+          comments={comments}
+          reviseState={reviseState}
+          reviseBlocked={reviseBlocked}
+          onAddComment={onAddComment}
+          onEditComment={onEditComment}
+          onDeleteComment={onDeleteComment}
+          onProcessComments={onProcessComments}
+          onReRunWithVideo={onReRunWithVideo}
+          onCancelRevise={onCancelRevise}
         />
       )}
     </div>

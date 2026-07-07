@@ -82,20 +82,27 @@ function renderTasks(tasks: StoredVellumTask[]): string {
     .join("\n");
 }
 
-/** Serialize the reviewer's comments, each tagged with what it targets. */
+/** Serialize the reviewer's comments, each tagged with what it targets (TASK-68.2:
+ *  a field range, an overview range, a whole task, a GROUP of tasks, or the whole
+ *  session). A group comment (`tasks`) names every task it spans so the model can
+ *  act on them together — e.g. merge them (the actual merge behavior is TASK-68.3). */
 function renderComments(comments: Comment[]): string {
   if (comments.length === 0) return "(no comments)";
   return comments
     .map((c) => {
-      if (c.kind === "global") return `- [session] ${c.body}`;
-      const target =
-        c.field === "overview"
-          ? "on the overview"
-          : c.taskId
-            ? `on task ${c.taskId}${c.field ? ` (${c.field})` : ""}`
-            : "on the session";
-      const quoted = c.quote ? ` re: “${c.quote}”` : "";
-      return `- [${target}]${quoted} ${c.body}`;
+      const t = c.target;
+      switch (t.type) {
+        case "global":
+          return `- [session] ${c.body}`;
+        case "overview":
+          return `- [overview] re: “${t.quote}” ${c.body}`;
+        case "field":
+          return `- [task ${t.taskId} (${t.field})] re: “${t.quote}” ${c.body}`;
+        case "task":
+          return `- [task ${t.taskId}] ${c.body}`;
+        case "tasks":
+          return `- [tasks ${t.taskIds.join(", ")}] ${c.body}`;
+      }
     })
     .join("\n");
 }

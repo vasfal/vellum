@@ -1,6 +1,7 @@
 "use client";
 
 // TASK-68.1 (parent TASK-68) — the interactive report document.
+// TASK-68.2 layers Google-Docs-style commenting directly on top of it.
 //
 // ONE surface replaces the old Tasks/Markdown switcher AND the View/Edit mode
 // toggle: the structured tasks.json (overview + each task) rendered as a
@@ -19,20 +20,31 @@
 //     each clickable to seek — the two-seek behavior (ADR-013) preserved.
 //   • Per task on hover: reorder, revert-to-AI-baseline, delete.
 //
-// Editing is offered only when `editing` is true (the live run with a parsed
-// analysis — see SessionView.canEdit); an archived / malformed run renders the
-// same document READ-ONLY (static pills, rendered markdown, no controls) — the
-// screenshot + timecode seeks still work.
+// COMMENTING (TASK-68.2) — always available on the live document (no mode):
+//   • Select any text → a floating Comment button → composer → an anchored (field
+//     or overview) comment, highlighted in place.
+//   • Click a highlighted span → its comment(s) pop up inline (view / edit / delete).
+//   • A whole task, or a GROUP of tasks, can be picked (per-task toggle → a floating
+//     bar) and commented as one unit; the whole session too (footer button).
+//   • Accumulated comments are turned into a new AI run from the footer (revise).
 //
-// SEAM (sibling task — do NOT implement here): select-to-comment. Each task
-// section carries `data-task-id`; a later commenting layer can resolve a text
-// selection back to its task/field from these attributes without re-architecting.
+// Editing/commenting are offered only when `editing` / `commenting` is true (the
+// live run with a parsed analysis — see SessionView.canEdit); an archived / malformed
+// run renders the same document READ-ONLY (no controls, no highlights).
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   ChevronDown,
   ChevronUp,
   ImageOff,
+  MessageSquare,
+  MessageSquarePlus,
   Plus,
   RotateCcw,
   Trash2,
@@ -44,6 +56,11 @@ import type {
   StoredVellumTask,
 } from "@/lib/gemini/stored";
 import { CATEGORIES, PRIORITIES } from "@/lib/gemini/schema";
+import {
+  commentQuote,
+  type Comment,
+  type CommentTarget,
+} from "@/lib/comments/comment";
 import { loadScreenshots } from "@/lib/filesystem/report-content";
 import { Button } from "@/components/ui/button";
 import {
@@ -63,6 +80,33 @@ import {
 import { cn } from "@/lib/utils";
 import { EditMarker, EnumSelect, InlineText } from "./inline-edit";
 import { MarkdownText } from "./markdown-text";
+import {
+  CommentComposer,
+  CommentFooter,
+  CommentThreadPopover,
+  SelectionCommentButton,
+  TaskSelectionBar,
+  commentAnchor,
+  hasActiveSelection,
+  taskLevelComments,
+  useCommentHighlights,
+  useDocumentTextSelection,
+  type PendingSelection,
+  type ReviseUiState,
+} from "./comment-mode";
+
+/** The composer's open state: the target it will create + where to anchor it. */
+interface ComposerState {
+  target: CommentTarget;
+  rect: { bottom: number; left: number };
+  contextLabel: string;
+}
+
+/** The click-to-view thread: which comment ids to show + where. */
+interface ThreadState {
+  ids: string[];
+  rect: { bottom: number; left: number };
+}
 
 export function ReportDocument({
   analysis,
@@ -81,6 +125,17 @@ export function ReportDocument({
   name,
   screenshotsDir,
   reloadToken,
+  // ---- TASK-68.2 commenting ----
+  commenting,
+  comments,
+  reviseState,
+  reviseBlocked,
+  onAddComment,
+  onEditComment,
+  onDeleteComment,
+  onProcessComments,
+  onReRunWithVideo,
+  onCancelRevise,
 }: {
   /** The active run's analysis: the live editable draft, or a read-only archive. */
   analysis: StoredAnalysisResult | null;
@@ -108,6 +163,21 @@ export function ReportDocument({
   screenshotsDir: string;
   /** Bumped after each save so the frame map re-reads if the run changed. */
   reloadToken: number;
+  /** Commenting is available (same gate as editing — the live parsed run). */
+  commenting: boolean;
+  /** All comments for the current version. */
+  comments: Comment[];
+  /** The comment→AI-revise busy/error state + whether a run blocks starting one. */
+  reviseState: ReviseUiState;
+  reviseBlocked: boolean;
+  /** Create a comment with the given target (autosaved by SessionView). */
+  onAddComment: (target: CommentTarget, body: string) => void;
+  onEditComment: (id: string, body: string) => void;
+  onDeleteComment: (id: string) => void;
+  /** Turn the accumulated comments into a new AI run (text-only / with video). */
+  onProcessComments: () => void;
+  onReRunWithVideo: () => void;
+  onCancelRevise: () => void;
 }) {
   const urls = useSessionScreenshots(workspace, name, screenshotsDir, reloadToken);
   const taskCount = analysis?.tasks.length ?? 0;
@@ -115,94 +185,306 @@ export function ReportDocument({
   // one can be written; a malformed/overview-less read-only run skips it entirely.
   const showOverview = analysis !== null && (overview !== "" || editing);
 
+  // Tasks in the shape the comment layer resolves anchors + labels against
+  // (StoredVellumTask structurally satisfies AnchorTarget).
+  const tasks = analysis?.tasks ?? [];
+
+  // ---- commenting interaction state ----------------------------------------
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // A captured text selection awaiting the floating "Comment" button (step 1).
+  const [pendingSelection, setPendingSelection] = useState<PendingSelection | null>(
+    null,
+  );
+  // The composer (step 2) — open for a range / task / group / session comment.
+  const [composer, setComposer] = useState<ComposerState | null>(null);
+  // The click-to-view thread popover.
+  const [thread, setThread] = useState<ThreadState | null>(null);
+  // Whole tasks picked for a task / task-group comment.
+  const [taskSelection, setTaskSelection] = useState<string[]>([]);
+
+  // Comments currently shown in the thread popover (resolved live so a delete /
+  // an external change reflects immediately; empty → the popover is effectively
+  // closed).
+  const threadComments = thread
+    ? comments.filter((c) => thread.ids.includes(c.id))
+    : [];
+  // The range comment being viewed, so its highlight lifts above the others.
+  const openId =
+    thread?.ids.find((id) =>
+      comments.some((c) => c.id === id && commentQuote(c)),
+    ) ?? null;
+
+  // Paint saved range highlights + get a click→comment resolver. Re-runs when the
+  // comments, the rendered analysis/overview, or the open comment change.
+  const resolveClick = useCommentHighlights(scrollRef, comments, openId, [
+    comments,
+    analysis,
+    overview,
+    editing,
+    openId,
+  ]);
+
+  // Watch for a text selection inside one commentable field → the pending anchor.
+  useDocumentTextSelection(commenting, scrollRef, setPendingSelection);
+
+  // Drop the floating Comment button once the selection collapses (a click away),
+  // so it doesn't linger with nothing selected.
+  useEffect(() => {
+    if (!commenting) return;
+    const onSel = () => {
+      const s = window.getSelection();
+      if (!s || s.isCollapsed) setPendingSelection(null);
+    };
+    document.addEventListener("selectionchange", onSel);
+    return () => document.removeEventListener("selectionchange", onSel);
+  }, [commenting]);
+
+  // A click that lands on a highlighted span opens that comment inline. Runs in the
+  // CAPTURE phase so it can pre-empt (and stop) the field's own click-to-edit.
+  const onClickCapture = useCallback(
+    (e: React.MouseEvent) => {
+      if (!commenting) return;
+      const ids = resolveClick(e.clientX, e.clientY);
+      if (ids.length === 0) return;
+      e.stopPropagation();
+      e.preventDefault();
+      setThread({ ids, rect: { bottom: e.clientY, left: e.clientX } });
+    },
+    [commenting, resolveClick],
+  );
+
+  const toggleTaskSelection = useCallback((taskId: string) => {
+    setTaskSelection((prev) =>
+      prev.includes(taskId)
+        ? prev.filter((id) => id !== taskId)
+        : [...prev, taskId],
+    );
+  }, []);
+
+  // Step 2: promote a captured selection into the composer.
+  const openComposerFromSelection = useCallback(() => {
+    setPendingSelection((sel) => {
+      if (sel) {
+        setComposer({
+          target: sel.target,
+          rect: { bottom: sel.rect.bottom, left: sel.rect.left },
+          contextLabel: `“${sel.target.quote}”`,
+        });
+      }
+      return null;
+    });
+  }, []);
+
+  // Open the composer for the whole-task / task-group selection, anchored centrally.
+  const openComposerFromTasks = useCallback(() => {
+    setTaskSelection((ids) => {
+      if (ids.length > 0) {
+        const target: CommentTarget =
+          ids.length === 1
+            ? { type: "task", taskId: ids[0] }
+            : { type: "tasks", taskIds: ids };
+        setComposer({
+          target,
+          rect: {
+            bottom: window.innerHeight - 72,
+            left: Math.max(12, window.innerWidth / 2 - 170),
+          },
+          contextLabel:
+            ids.length === 1 ? "This task" : `${ids.length} tasks`,
+        });
+      }
+      return ids; // keep the selection until the comment is saved
+    });
+  }, []);
+
+  // The footer "Comment on session" button opens the composer for a global comment.
+  const openSessionComposer = useCallback(
+    (rect: { bottom: number; left: number }) => {
+      setComposer({
+        target: { type: "global" },
+        rect,
+        contextLabel: "Comment on the whole session",
+      });
+    },
+    [],
+  );
+
+  const submitComposer = useCallback(
+    (body: string) => {
+      if (!composer) return;
+      onAddComment(composer.target, body);
+      setComposer(null);
+      setTaskSelection([]);
+      window.getSelection()?.removeAllRanges();
+    },
+    [composer, onAddComment],
+  );
+
+  // Open the thread popover for a whole task's task-level comments (its badge).
+  const openTaskComments = useCallback(
+    (taskId: string, rect: { bottom: number; left: number }) => {
+      const ids = taskLevelComments(comments, taskId).map((c) => c.id);
+      if (ids.length > 0) setThread({ ids, rect });
+    },
+    [comments],
+  );
+
   return (
-    // The pane is the app background; a centered prose column reads like the
-    // document it is (ADR-004). Hairline rules (divide-y) separate the overview and
-    // each task — the on-screen echo of report.md's "---" section breaks.
-    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-background">
-      <div className="mx-auto flex w-full max-w-2xl flex-col divide-y divide-border/60 px-6">
-        {showOverview && (
-          <section className="flex flex-col gap-2 py-8">
-            <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
-              Overview
-            </span>
-            <DocumentOverview
-              overview={overview}
-              editing={editing}
-              onChange={onOverviewChange}
-              baseline={overviewBaseline}
-            />
-          </section>
+    // Outer column: the scrolling document over a (commenting-only) sticky footer.
+    <div className="flex min-h-0 flex-1 flex-col bg-background">
+      <div
+        ref={scrollRef}
+        onClickCapture={onClickCapture}
+        className={cn(
+          "flex min-h-0 flex-1 flex-col overflow-y-auto",
+          // Tint the live selection with the comment-highlight yellow while
+          // commenting, so "the span I'm about to comment" reads as the same signal
+          // as the saved highlights (scoped, so default selection is untouched).
+          commenting && "comment-selection",
         )}
-
-        {malformed && (
-          <div className="py-8">
-            <div className="flex items-center gap-2 rounded-lg bg-sidebar px-4 py-3 text-xs text-muted-foreground">
-              <TriangleAlert className="size-3.5 shrink-0" strokeWidth={1.5} />
-              <span>
-                This session&apos;s <code className="font-mono">tasks.json</code>{" "}
-                couldn&apos;t be read. The recording still plays.
+      >
+        <div className="mx-auto flex w-full max-w-2xl flex-col divide-y divide-border/60 px-6">
+          {showOverview && (
+            <section className="flex flex-col gap-2 py-8">
+              <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
+                Overview
               </span>
-            </div>
-          </div>
-        )}
-
-        {analysis && analysis.tasks.length > 0
-          ? analysis.tasks.map((task, i) => (
-              <TaskSection
-                key={task.id ?? i}
-                task={task}
-                index={i}
+              <DocumentOverview
+                overview={overview}
                 editing={editing}
-                baselineTask={baselineById.get(task.id)}
-                screenshotUrl={urls.get(task.screenshot ?? "")}
-                onChange={(patch) => onTaskChange(i, patch)}
-                onDelete={() => onDeleteTask(i)}
-                onMoveUp={i > 0 ? () => onMoveTask(i, -1) : undefined}
-                onMoveDown={
-                  i < taskCount - 1 ? () => onMoveTask(i, 1) : undefined
-                }
-                onSeek={onSeek}
+                commenting={commenting}
+                onChange={onOverviewChange}
+                baseline={overviewBaseline}
               />
-            ))
-          : !editing && (
-              <p className="py-8 text-sm text-muted-foreground">
-                {malformed
-                  ? "No tasks to show."
-                  : "No tasks were extracted from this recording."}
-              </p>
-            )}
+            </section>
+          )}
 
-        {editing && (
-          <div className="py-8">
-            {/* Add a blank task at the end — a restrained dashed-outline ghost
-                button, the same language as the unanalyzed-session rows. */}
-            <button
-              type="button"
-              onClick={onAddTask}
-              className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-dashed border-border py-3 text-sm font-medium text-muted-foreground transition-colors duration-150 ease-out hover:bg-sidebar hover:text-foreground active:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-            >
-              <Plus className="size-4" strokeWidth={1.5} />
-              Add task
-            </button>
-          </div>
-        )}
+          {malformed && (
+            <div className="py-8">
+              <div className="flex items-center gap-2 rounded-lg bg-sidebar px-4 py-3 text-xs text-muted-foreground">
+                <TriangleAlert className="size-3.5 shrink-0" strokeWidth={1.5} />
+                <span>
+                  This session&apos;s <code className="font-mono">tasks.json</code>{" "}
+                  couldn&apos;t be read. The recording still plays.
+                </span>
+              </div>
+            </div>
+          )}
+
+          {analysis && analysis.tasks.length > 0
+            ? analysis.tasks.map((task, i) => (
+                <TaskSection
+                  key={task.id ?? i}
+                  task={task}
+                  index={i}
+                  editing={editing}
+                  commenting={commenting}
+                  baselineTask={baselineById.get(task.id)}
+                  screenshotUrl={urls.get(task.screenshot ?? "")}
+                  taskComments={
+                    commenting ? taskLevelComments(comments, task.id) : []
+                  }
+                  selectedForComment={taskSelection.includes(task.id)}
+                  onToggleCommentSelect={() => toggleTaskSelection(task.id)}
+                  onOpenTaskComments={(rect) => openTaskComments(task.id, rect)}
+                  onChange={(patch) => onTaskChange(i, patch)}
+                  onDelete={() => onDeleteTask(i)}
+                  onMoveUp={i > 0 ? () => onMoveTask(i, -1) : undefined}
+                  onMoveDown={
+                    i < taskCount - 1 ? () => onMoveTask(i, 1) : undefined
+                  }
+                  onSeek={onSeek}
+                />
+              ))
+            : !editing && (
+                <p className="py-8 text-sm text-muted-foreground">
+                  {malformed
+                    ? "No tasks to show."
+                    : "No tasks were extracted from this recording."}
+                </p>
+              )}
+
+          {editing && (
+            <div className="py-8">
+              {/* Add a blank task at the end — a restrained dashed-outline ghost
+                  button, the same language as the unanalyzed-session rows. */}
+              <button
+                type="button"
+                onClick={onAddTask}
+                className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-dashed border-border py-3 text-sm font-medium text-muted-foreground transition-colors duration-150 ease-out hover:bg-sidebar hover:text-foreground active:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              >
+                <Plus className="size-4" strokeWidth={1.5} />
+                Add task
+              </button>
+            </div>
+          )}
+        </div>
       </div>
+
+      {/* Commenting footer — the session-comment affordance + the revise controls. */}
+      {commenting && (
+        <CommentFooter
+          commentCount={comments.length}
+          state={reviseState}
+          blocked={reviseBlocked}
+          onSessionComment={openSessionComposer}
+          onProcess={onProcessComments}
+          onReRunWithVideo={onReRunWithVideo}
+          onCancel={onCancelRevise}
+        />
+      )}
+
+      {/* Floating commenting UI (portaled to body). */}
+      {commenting && pendingSelection && !composer && (
+        <SelectionCommentButton
+          rect={pendingSelection.rect}
+          onClick={openComposerFromSelection}
+        />
+      )}
+      {commenting && composer && (
+        <CommentComposer
+          rect={composer.rect}
+          contextLabel={composer.contextLabel}
+          onSave={submitComposer}
+          onCancel={() => setComposer(null)}
+        />
+      )}
+      {commenting && thread && threadComments.length > 0 && (
+        <CommentThreadPopover
+          rect={thread.rect}
+          comments={threadComments}
+          tasks={tasks}
+          overview={overview}
+          onEdit={onEditComment}
+          onDelete={onDeleteComment}
+          onClose={() => setThread(null)}
+        />
+      )}
+      {commenting && taskSelection.length > 0 && !composer && (
+        <TaskSelectionBar
+          count={taskSelection.length}
+          onComment={openComposerFromTasks}
+          onClear={() => setTaskSelection([])}
+        />
+      )}
     </div>
   );
 }
 
 // The session overview at the top of the document: markdown-aware inline edit when
 // editing, rendered markdown when read-only. A quiet edited-marker + revert sits
-// beside it (like every other field).
+// beside it. While commenting, the rendered block carries the comment anchor so a
+// text selection resolves to an `overview` range.
 function DocumentOverview({
   overview,
   editing,
+  commenting,
   onChange,
   baseline,
 }: {
   overview: string;
   editing: boolean;
+  commenting: boolean;
   onChange: (next: string) => void;
   baseline: string | undefined;
 }) {
@@ -210,7 +492,12 @@ function DocumentOverview({
     const edited = baseline !== undefined && overview !== baseline;
     return (
       <div className="group/field flex items-start gap-1">
-        <span className="min-w-0 flex-1">
+        <span
+          className="min-w-0 flex-1"
+          data-comment-anchor={
+            commenting ? commentAnchor("overview", "overview") : undefined
+          }
+        >
           <InlineMarkdown
             value={overview}
             ariaLabel="Session overview"
@@ -230,19 +517,32 @@ function DocumentOverview({
     );
   }
   // Read-only: the gate above only renders this block when overview is non-empty.
-  return <MarkdownText text={overview} />;
+  return (
+    <span
+      data-comment-anchor={
+        commenting ? commentAnchor("overview", "overview") : undefined
+      }
+    >
+      <MarkdownText text={overview} />
+    </span>
+  );
 }
 
 // One task as a document section: numbered heading + title, a meta row (type /
 // priority pills + timecode chips), the inline screenshot, the markdown-aware
-// description, the screen-context note, and — while editing, on hover — a quiet
-// footer rail of reorder / revert / delete controls.
+// description, the screen-context note, and — while editing / commenting, on hover —
+// a quiet footer rail of comment / reorder / revert / delete controls.
 function TaskSection({
   task,
   index,
   editing,
+  commenting,
   baselineTask,
   screenshotUrl,
+  taskComments,
+  selectedForComment,
+  onToggleCommentSelect,
+  onOpenTaskComments,
   onChange,
   onDelete,
   onMoveUp,
@@ -252,10 +552,17 @@ function TaskSection({
   task: StoredVellumTask;
   index: number;
   editing: boolean;
+  commenting: boolean;
   /** The AI baseline for this task id — absent for a human-added task. */
   baselineTask?: StoredVellumTask;
   /** Resolved object URL for this task's stored frame, or undefined (no preview). */
   screenshotUrl?: string;
+  /** Whole-task / group comments attached to THIS task (for its badge). */
+  taskComments: Comment[];
+  /** This task is picked for a task / task-group comment. */
+  selectedForComment: boolean;
+  onToggleCommentSelect: () => void;
+  onOpenTaskComments: (rect: { bottom: number; left: number }) => void;
   onChange: (patch: Partial<StoredVellumTask>) => void;
   onDelete: () => void;
   onMoveUp?: () => void;
@@ -292,18 +599,28 @@ function TaskSection({
   );
 
   return (
-    // `data-task-id` is the seam a later select-to-comment layer resolves against
-    // (sibling task) — no commenting behavior is wired here.
+    // `data-task-id` is the section identity the commenting layer reads. A selected-
+    // for-comment task takes a quiet inset ring so it's clear what a group comment
+    // will cover.
     <section
       data-task-id={task.id}
-      className="group relative flex scroll-mt-4 flex-col gap-3 py-8"
+      className={cn(
+        "group relative flex scroll-mt-4 flex-col gap-3 py-8",
+        selectedForComment &&
+          "rounded-lg ring-1 ring-inset ring-foreground/25",
+      )}
     >
       <div className="flex items-start gap-3">
         <span className="mt-1 shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
           {String(index + 1).padStart(2, "0")}
         </span>
         <span className="flex min-w-0 flex-1 items-start gap-1">
-          <span className="min-w-0 flex-1">
+          <span
+            className="min-w-0 flex-1"
+            data-comment-anchor={
+              commenting ? commentAnchor(task.id, "title") : undefined
+            }
+          >
             {editing ? (
               <InlineText
                 value={task.title}
@@ -318,6 +635,12 @@ function TaskSection({
             )}
           </span>
           {editing && changed("title") && <FieldDot />}
+          {commenting && taskComments.length > 0 && (
+            <TaskCommentBadge
+              count={taskComments.length}
+              onOpen={onOpenTaskComments}
+            />
+          )}
         </span>
       </div>
 
@@ -381,7 +704,12 @@ function TaskSection({
 
       {/* Description — markdown-aware inline edit (raw on click, rendered on blur). */}
       <div className="flex items-start gap-1">
-        <span className="min-w-0 flex-1">
+        <span
+          className="min-w-0 flex-1"
+          data-comment-anchor={
+            commenting ? commentAnchor(task.id, "description") : undefined
+          }
+        >
           {editing ? (
             <InlineMarkdown
               value={task.description}
@@ -398,59 +726,111 @@ function TaskSection({
       {/* Screen context — a quieter note; plain inline text (not markdown). A
           human-added task may carry none (undefined) → the row is skipped. */}
       {task.screen_context !== undefined && (
-          <div className="flex items-start gap-1 text-xs leading-relaxed text-muted-foreground/80">
-            <span className="shrink-0 py-0.5 text-muted-foreground/60">
-              Screen —
-            </span>
-            <span className="min-w-0 flex-1">
-              {editing ? (
-                <InlinePlainText
-                  value={task.screen_context}
-                  ariaLabel="On-screen context"
-                  className="text-xs leading-relaxed text-muted-foreground/80"
-                  onCommit={(next) => onChange({ screen_context: next })}
-                />
-              ) : (
-                <span>{task.screen_context}</span>
-              )}
-            </span>
-            {editing && changed("screen_context") && <FieldDot />}
-          </div>
-        )}
+        <div className="flex items-start gap-1 text-xs leading-relaxed text-muted-foreground/80">
+          <span className="shrink-0 py-0.5 text-muted-foreground/60">
+            Screen —
+          </span>
+          <span
+            className="min-w-0 flex-1"
+            data-comment-anchor={
+              commenting ? commentAnchor(task.id, "screen_context") : undefined
+            }
+          >
+            {editing ? (
+              <InlinePlainText
+                value={task.screen_context}
+                ariaLabel="On-screen context"
+                className="text-xs leading-relaxed text-muted-foreground/80"
+                onCommit={(next) => onChange({ screen_context: next })}
+              />
+            ) : (
+              <span>{task.screen_context}</span>
+            )}
+          </span>
+          {editing && changed("screen_context") && <FieldDot />}
+        </div>
+      )}
 
-      {/* Hover controls (editing only): reorder left; revert-to-AI + delete right.
-          opacity-0 at rest so the document reads clean; the row's height is always
-          reserved so revealing it never shifts the section. Delete is always
-          available while editing, so the rail always renders here. */}
-      {editing && (
-        <div className="flex items-center justify-between opacity-0 transition-opacity duration-150 ease-out group-hover:opacity-100 focus-within:opacity-100">
+      {/* Hover controls (editing / commenting): the comment toggle on the left,
+          reorder + revert-to-AI + delete on the right. opacity-0 at rest so the
+          document reads clean; a selected-for-comment task keeps its toggle visible. */}
+      {(editing || commenting) && (
+        <div
+          className={cn(
+            "flex items-center justify-between transition-opacity duration-150 ease-out group-hover:opacity-100 focus-within:opacity-100",
+            selectedForComment ? "opacity-100" : "opacity-0",
+          )}
+        >
           <div className="flex items-center gap-0.5">
-            <ControlIcon
-              label="Move up"
-              icon={ChevronUp}
-              onClick={onMoveUp}
-              disabled={!onMoveUp}
-            />
-            <ControlIcon
-              label="Move down"
-              icon={ChevronDown}
-              onClick={onMoveDown}
-              disabled={!onMoveDown}
-            />
-          </div>
-          <div className="flex items-center gap-0.5">
-            {taskEdited && (
+            {commenting && (
               <ControlIcon
-                label="Revert to AI"
-                icon={RotateCcw}
-                onClick={revertTask}
+                label={
+                  selectedForComment
+                    ? "Remove from comment selection"
+                    : "Select task to comment"
+                }
+                icon={MessageSquarePlus}
+                onClick={onToggleCommentSelect}
+                active={selectedForComment}
               />
             )}
-            <DeleteControl title={task.title} onDelete={onDelete} />
+            {editing && (
+              <>
+                <ControlIcon
+                  label="Move up"
+                  icon={ChevronUp}
+                  onClick={onMoveUp}
+                  disabled={!onMoveUp}
+                />
+                <ControlIcon
+                  label="Move down"
+                  icon={ChevronDown}
+                  onClick={onMoveDown}
+                  disabled={!onMoveDown}
+                />
+              </>
+            )}
           </div>
+          {editing && (
+            <div className="flex items-center gap-0.5">
+              {taskEdited && (
+                <ControlIcon
+                  label="Revert to AI"
+                  icon={RotateCcw}
+                  onClick={revertTask}
+                />
+              )}
+              <DeleteControl title={task.title} onDelete={onDelete} />
+            </div>
+          )}
         </div>
       )}
     </section>
+  );
+}
+
+// The whole-task / group comment badge beside a task title: a small count that opens
+// the thread popover on the task-level comments attached here.
+function TaskCommentBadge({
+  count,
+  onOpen,
+}: {
+  count: number;
+  onOpen: (rect: { bottom: number; left: number }) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        onOpen({ bottom: r.bottom, left: r.left });
+      }}
+      aria-label={`${count} ${count === 1 ? "comment" : "comments"} on this task`}
+      className="mt-1 inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-1.5 py-px text-[10px] font-medium leading-none text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground active:opacity-80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+    >
+      <MessageSquare className="size-3" strokeWidth={1.5} />
+      {count}
+    </button>
   );
 }
 
@@ -607,6 +987,8 @@ function InlineMarkdown({
   }, [editing, draft]);
 
   const start = () => {
+    // Don't hijack a text selection meant for commenting (TASK-68.2).
+    if (hasActiveSelection()) return;
     setDraft(value);
     setEditing(true);
   };
@@ -691,6 +1073,8 @@ function InlinePlainText({
   }, [editing, draft]);
 
   const start = () => {
+    // Don't hijack a text selection meant for commenting (TASK-68.2).
+    if (hasActiveSelection()) return;
     setDraft(value);
     setEditing(true);
   };
@@ -732,8 +1116,9 @@ function InlinePlainText({
     <button
       type="button"
       onClick={start}
+      // select-text so a drag-select of this note can become a comment (TASK-68.2).
       className={cn(
-        "-mx-1 block w-[calc(100%+0.5rem)] rounded-sm px-1 py-0.5 text-left transition-colors duration-150 ease-out hover:bg-sidebar active:opacity-80",
+        "-mx-1 block w-[calc(100%+0.5rem)] select-text rounded-sm px-1 py-0.5 text-left transition-colors duration-150 ease-out hover:bg-sidebar active:opacity-80",
         className,
       )}
     >
@@ -754,18 +1139,21 @@ function FieldDot() {
   );
 }
 
-// A quiet reorder / revert icon-button. Thin Lucide glyph, monochrome; a disabled
-// end-of-list control dims and stops responding (ADR-004/005).
+// A quiet comment / reorder / revert icon-button. Thin Lucide glyph, monochrome; a
+// disabled end-of-list control dims and stops responding (ADR-004/005). `active`
+// keeps a toggled control (the comment-select) at full contrast.
 function ControlIcon({
   label,
   icon: Icon,
   onClick,
   disabled,
+  active,
 }: {
   label: string;
   icon: typeof ChevronUp;
   onClick?: () => void;
   disabled?: boolean;
+  active?: boolean;
 }) {
   return (
     <Tooltip>
@@ -776,7 +1164,11 @@ function ControlIcon({
             onClick={onClick}
             disabled={disabled}
             aria-label={label}
-            className="rounded-sm p-1 text-muted-foreground transition-colors duration-150 ease-out hover:bg-sidebar hover:text-foreground active:opacity-80 disabled:pointer-events-none disabled:opacity-30 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            aria-pressed={active}
+            className={cn(
+              "rounded-sm p-1 transition-colors duration-150 ease-out hover:bg-sidebar hover:text-foreground active:opacity-80 disabled:pointer-events-none disabled:opacity-30 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+              active ? "text-foreground" : "text-muted-foreground",
+            )}
           />
         }
       >
