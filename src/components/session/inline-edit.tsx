@@ -40,6 +40,11 @@ export function InlineText({
   const [draft, setDraft] = useState(value);
 
   const start = () => {
+    // Don't hijack a text selection meant for commenting (TASK-68.2): a drag-select
+    // that ends on this value shouldn't flip it into an editor. A plain (collapsed)
+    // click still enters edit mode.
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim()) return;
     setDraft(value);
     setEditing(true);
   };
@@ -80,8 +85,10 @@ export function InlineText({
     <button
       type="button"
       onClick={start}
+      // select-text so a drag-select of the value can be made into a comment
+      // (TASK-68.2) — a <button>'s text isn't selectable by default in Chromium.
       className={cn(
-        "-mx-1 rounded-sm px-1 py-0.5 text-left transition-colors duration-150 ease-out hover:bg-sidebar active:opacity-80",
+        "-mx-1 select-text rounded-sm px-1 py-0.5 text-left transition-colors duration-150 ease-out hover:bg-sidebar active:opacity-80",
         className,
       )}
     >

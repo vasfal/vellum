@@ -1,47 +1,83 @@
 /**
- * Comment model (TASK-59, ADR-024) — the plannotator ANNOTATION layer stored in a
- * per-version `comments.json` sidecar beside the session's tasks.json/report.md.
+ * Comment model (TASK-59 → TASK-68.2, ADR-024) — the plannotator ANNOTATION layer
+ * stored in a per-version `comments.json` sidecar beside tasks.json/report.md.
  *
- * Comments are a SEPARATE sidecar from the analysis contract: Comment mode never
- * touches tasks.json / report.md (that is Edit mode's job, ADR-024). A comment is
- * either ANCHORED to a span of a task field / the overview (kind "anchor") or a
- * GLOBAL note on the whole session (kind "global").
+ * Comments are a SEPARATE sidecar from the analysis contract: commenting never
+ * touches tasks.json / report.md (that's inline editing's job). A comment carries a
+ * `body` and a `target` describing WHAT it annotates. TASK-68.2 widens the target
+ * from "a text range OR the whole session" to FIVE kinds so Google-Docs-style
+ * commenting can address the document at any granularity:
  *
- * Anchoring is deliberately QUOTE-BASED (ADR-024 — "best-effort"): we store the
- * selected substring, its task id, and which field it came from, NOT character
- * offsets. This is robust enough for highlighting and survives most edits; when the
- * quoted text no longer appears (a later Edit changed it) the comment DEGRADES to
- * task-level rather than being lost (see `resolveCommentAnchor`).
+ *   • field    — a text RANGE inside one task field (title/description/screen_context)
+ *   • overview — a text RANGE inside the session overview
+ *   • task     — a WHOLE task (title + description + screen_context + timecodes)
+ *   • tasks    — a GROUP of tasks (e.g. "merge these into one")
+ *   • global   — the whole session (no anchor)
  *
- * Client-safe: pure Zod + string logic, no node:* / DOM. TASK-60 ("Process
- * comments") reads this same shape to feed Gemini; it is not wired here.
+ * Anchoring for the two RANGE kinds stays QUOTE-BASED (ADR-024 — no character
+ * offsets): we store the selected substring, its task id, and the field. Robust
+ * enough to highlight and survives most edits; when the quoted text no longer
+ * appears the comment DEGRADES rather than being lost (see resolveCommentAnchor).
+ * The task / tasks kinds anchor by id, so they degrade only when a target task is
+ * deleted.
+ *
+ * Back-compat: comments written before TASK-68.2 used a FLAT shape
+ * ({ kind, taskId?, field?, quote? }). readComments upgrades them on load via the
+ * lenient CommentsFileSchema below; writeComments always persists the new `target`
+ * shape, so an old sidecar migrates the first time it's saved.
+ *
+ * Client-safe: pure Zod + string logic, no node:* / DOM.
  */
 import { z } from "zod";
 
-/** An anchored comment points at a span; a global one has no anchor. */
-export const COMMENT_KINDS = ["anchor", "global"] as const;
-export type CommentKind = (typeof COMMENT_KINDS)[number];
-
-/** The fields a comment can anchor to. `overview` is session-level (no taskId);
- *  the other three are per-task text fields (see report-document.tsx). */
-export const COMMENT_FIELDS = [
+/** The task text fields a RANGE comment can anchor to (the overview is its own
+ *  target kind — it's session-level, with no task id). */
+export const COMMENT_TASK_FIELDS = [
   "title",
   "description",
   "screen_context",
-  "overview",
 ] as const;
-export type CommentField = (typeof COMMENT_FIELDS)[number];
+export type CommentTaskField = (typeof COMMENT_TASK_FIELDS)[number];
+
+// ---- the target: a clean discriminated union on `type` ---------------------
+
+/** A text range inside one task field (quote-based, ADR-024). */
+const FieldTargetSchema = z.object({
+  type: z.literal("field"),
+  taskId: z.string().min(1),
+  field: z.enum(COMMENT_TASK_FIELDS),
+  quote: z.string().min(1),
+});
+/** A text range inside the session overview. */
+const OverviewTargetSchema = z.object({
+  type: z.literal("overview"),
+  quote: z.string().min(1),
+});
+/** A whole task, addressed by id (title + description + context + timecodes). */
+const TaskTargetSchema = z.object({
+  type: z.literal("task"),
+  taskId: z.string().min(1),
+});
+/** A group of tasks, addressed by id (e.g. "merge these"). */
+const TasksTargetSchema = z.object({
+  type: z.literal("tasks"),
+  taskIds: z.array(z.string().min(1)).min(1),
+});
+/** The whole session (no anchor). */
+const GlobalTargetSchema = z.object({ type: z.literal("global") });
+
+export const CommentTargetSchema = z.discriminatedUnion("type", [
+  FieldTargetSchema,
+  OverviewTargetSchema,
+  TaskTargetSchema,
+  TasksTargetSchema,
+  GlobalTargetSchema,
+]);
+export type CommentTarget = z.infer<typeof CommentTargetSchema>;
 
 export const CommentSchema = z.object({
   id: z.string().min(1),
-  kind: z.enum(COMMENT_KINDS),
-  // Present only for an anchor comment on a task field. Absent for a global
-  // comment and for an overview anchor (which is session-level, no task).
-  taskId: z.string().min(1).optional(),
-  field: z.enum(COMMENT_FIELDS).optional(),
-  // The selected substring the comment is anchored to (the quote). Absent for a
-  // global comment.
-  quote: z.string().min(1).optional(),
+  target: CommentTargetSchema,
   // The comment text itself — always required.
   body: z.string().min(1),
   createdAt: z.string().min(1),
@@ -49,12 +85,61 @@ export const CommentSchema = z.object({
 
 export type Comment = z.infer<typeof CommentSchema>;
 
-/** The on-disk shape of comments.json. */
+// ---- back-compat: upgrade the pre-68.2 flat shape on read ------------------
+
+/** The flat comment shape used before TASK-68.2 — kept ONLY to migrate old
+ *  sidecars. `kind: "anchor"` carried an optional taskId/field/quote; "global"
+ *  carried none. The `overview` field value was session-level (no taskId). */
+const LegacyCommentSchema = z.object({
+  id: z.string().min(1),
+  kind: z.enum(["anchor", "global"]),
+  taskId: z.string().min(1).optional(),
+  field: z.enum(["title", "description", "screen_context", "overview"]).optional(),
+  quote: z.string().min(1).optional(),
+  body: z.string().min(1),
+  createdAt: z.string().min(1),
+});
+
+/** Map a legacy comment onto a new target. A partial/ambiguous legacy anchor
+ *  degrades to the coarsest still-valid target rather than being dropped. */
+function legacyTarget(c: z.infer<typeof LegacyCommentSchema>): CommentTarget {
+  if (c.kind === "global") return { type: "global" };
+  if (c.field === "overview") {
+    return c.quote ? { type: "overview", quote: c.quote } : { type: "global" };
+  }
+  if (c.taskId && c.field && c.quote) {
+    return { type: "field", taskId: c.taskId, field: c.field, quote: c.quote };
+  }
+  if (c.taskId) return { type: "task", taskId: c.taskId };
+  return { type: "global" };
+}
+
+/** One stored comment, accepting EITHER the new `target` shape or a legacy flat one
+ *  (upgraded to the new shape). Used only for READING — writes go through the strict
+ *  CommentSchema so a malformed comment never reaches disk. */
+const StoredCommentSchema: z.ZodType<Comment> = z.union([
+  CommentSchema,
+  LegacyCommentSchema.transform(
+    (c): Comment => ({
+      id: c.id,
+      body: c.body,
+      createdAt: c.createdAt,
+      target: legacyTarget(c),
+    }),
+  ),
+]);
+
+/** The on-disk shape of comments.json (lenient — upgrades legacy comments). */
 export const CommentsFileSchema = z.object({
-  comments: z.array(CommentSchema),
+  comments: z.array(StoredCommentSchema),
 });
 
 export type CommentsFile = z.infer<typeof CommentsFileSchema>;
+
+/** Strict validator for WRITING — guarantees only the new shape is persisted. */
+export const CommentsWriteSchema = z.object({
+  comments: z.array(CommentSchema),
+});
 
 /**
  * Mint a collision-free id for a new comment. Mirrors mintTaskId (stored.ts): take
@@ -73,12 +158,13 @@ export function mintCommentId(existing: Comment[]): string {
 
 /**
  * How an anchor resolves against the CURRENT tasks (ADR-024 degraded-anchor).
- *   - "anchored" — the quote still appears in its task/field; highlight the span.
- *   - "degraded" — the task still exists but its text no longer contains the quote
- *                  (a later Edit changed it); keep the comment, attach it at task
- *                  level, don't highlight.
- *   - "orphan"   — the task the comment pointed at is gone (deleted), OR the
- *                  comment is global; list it as a general/session comment.
+ *   - "anchored" — the target is fully present: a range still occurs, or every
+ *                  referenced task still exists.
+ *   - "degraded" — the target partly survives: a range's task exists but its quote
+ *                  no longer occurs (a later edit changed it), or SOME of a group's
+ *                  tasks are gone. Keep the comment; don't highlight the lost part.
+ *   - "orphan"   — nothing to anchor to: the target task is gone, every group task
+ *                  is gone, or the comment is global/session-level.
  */
 export type CommentAnchorStatus = "anchored" | "degraded" | "orphan";
 
@@ -93,39 +179,42 @@ export interface AnchorTarget {
 
 /**
  * Resolve a comment's anchor against the current tasks + overview. Pure and
- * side-effect free — this is the degraded-anchor logic the UI renders from and the
- * TASK-59 throwaway script exercises.
- *
- * - A global comment is always "orphan" (session-level; nothing to anchor to).
- * - An overview anchor checks the quote against `overview`.
- * - A task-field anchor looks the task up by id: gone → "orphan"; present and the
- *   quote still occurs in the field → "anchored"; present but the quote is missing
- *   → "degraded".
+ * side-effect free — the UI renders each comment's status from this.
  */
 export function resolveCommentAnchor(
   comment: Comment,
   tasks: AnchorTarget[],
   overview: string,
 ): CommentAnchorStatus {
-  if (comment.kind === "global" || !comment.quote) return "orphan";
-
-  if (comment.field === "overview" && comment.taskId === undefined) {
-    return overview.includes(comment.quote) ? "anchored" : "degraded";
+  const t = comment.target;
+  switch (t.type) {
+    case "global":
+      return "orphan"; // session-level; nothing to anchor to
+    case "overview":
+      return overview.includes(t.quote) ? "anchored" : "degraded";
+    case "field": {
+      const task = tasks.find((x) => x.id === t.taskId);
+      if (!task) return "orphan"; // the anchored task was deleted
+      const haystack =
+        t.field === "title"
+          ? task.title
+          : t.field === "description"
+            ? task.description
+            : task.screen_context ?? "";
+      return haystack.includes(t.quote) ? "anchored" : "degraded";
+    }
+    case "task":
+      return tasks.some((x) => x.id === t.taskId) ? "anchored" : "orphan";
+    case "tasks": {
+      const present = t.taskIds.filter((id) => tasks.some((x) => x.id === id));
+      if (present.length === 0) return "orphan"; // every grouped task is gone
+      return present.length === t.taskIds.length ? "anchored" : "degraded";
+    }
   }
+}
 
-  const task = comment.taskId
-    ? tasks.find((t) => t.id === comment.taskId)
-    : undefined;
-  if (!task) return "orphan"; // the anchored task was deleted
-
-  const haystack =
-    comment.field === "title"
-      ? task.title
-      : comment.field === "description"
-        ? task.description
-        : comment.field === "screen_context"
-          ? task.screen_context ?? ""
-          : "";
-
-  return haystack.includes(comment.quote) ? "anchored" : "degraded";
+/** The quote a RANGE comment highlights, or undefined for a non-range target. */
+export function commentQuote(comment: Comment): string | undefined {
+  const t = comment.target;
+  return t.type === "field" || t.type === "overview" ? t.quote : undefined;
 }

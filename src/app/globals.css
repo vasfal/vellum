@@ -226,6 +226,28 @@
 }
 
 /*
+  TASK-68.2 — saved comment highlights, painted via the CSS Custom Highlight API
+  (Chromium-only, matching the app's File System Access target). This lets a
+  commented text RANGE be highlighted over rendered Markdown WITHOUT wrapping DOM
+  nodes (which would fight React reconciliation in the report document). The same
+  muted comment-highlight yellow the live selection uses (ADR-018/019 hue
+  exception); it reads on both themes since it's token-based. `cursor` hints that a
+  highlighted span is clickable (click opens its comment). `.is-open` is set while a
+  comment's popover is open, to lift that span a touch above its neighbours.
+*/
+::highlight(vellum-comment) {
+  background-color: var(--comment-highlight);
+  color: var(--comment-highlight-foreground);
+  border-radius: 2px;
+}
+::highlight(vellum-comment-open) {
+  background-color: var(--comment-highlight);
+  color: var(--comment-highlight-foreground);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/*
   Empty-state illustration (TASK-39). Ambient, looped motion for the
   nothing-selected home screen: the Vellum mark breathes while two square rings
   echo outward — a quiet nod to "capture" without a spinner or accent color
