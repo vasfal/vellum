@@ -23,7 +23,7 @@ export const COMMENT_KINDS = ["anchor", "global"] as const;
 export type CommentKind = (typeof COMMENT_KINDS)[number];
 
 /** The fields a comment can anchor to. `overview` is session-level (no taskId);
- *  the other three are per-task text fields (see task-list-item.tsx). */
+ *  the other three are per-task text fields (see report-document.tsx). */
 export const COMMENT_FIELDS = [
   "title",
   "description",

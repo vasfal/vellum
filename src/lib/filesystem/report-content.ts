@@ -46,6 +46,22 @@ export async function loadReportContent(
   return { markdown, screenshots };
 }
 
+/**
+ * Load just a run's screenshot frames, keyed by filename, WITHOUT the report
+ * Markdown. TASK-68.1 — the interactive report document renders each task's frame
+ * inline from its stored `screenshot` filename (ADR-025), so it needs the frame
+ * map on its own (the Markdown pane's report.md read is gone). A missing/absent
+ * screenshots folder degrades to an empty map (images just don't resolve).
+ */
+export async function loadScreenshots(
+  workspace: FileSystemDirectoryHandle,
+  name: string,
+  screenshotsDir: string = "screenshots",
+): Promise<Map<string, File>> {
+  const dir = await workspace.getDirectoryHandle(name);
+  return loadScreenshotMap(dir, screenshotsDir);
+}
+
 /** Every file under `screenshotsDir`, keyed by filename. Missing folder → empty map. */
 async function loadScreenshotMap(
   dir: FileSystemDirectoryHandle,
